@@ -1,100 +1,89 @@
-# RabbitMQ Server
+# UniSaaS.UniCORE.RabbitMQ
 
-[![CI](https://github.com/rabbitmq/rabbitmq-server/actions/workflows/test-make.yaml/badge.svg)](https://github.com/rabbitmq/rabbitmq-server/actions/workflows/test-make.yaml)
+**SCAFFOLD-ANCHOR repository — initial scaffold 2026-06-04.**
 
-[RabbitMQ](https://rabbitmq.com) is a [feature rich](https://www.rabbitmq.com/docs),
-multi-protocol messaging and streaming broker. It supports:
+Full scaffolding, upstream-fork integration, and source-code work all pending a fresh dedicated kickoff arc. This initial commit exists to lock the repository's identity, licence position, and place in the UniCORE Sanity Check fleet so the work cannot be forgotten.
 
- * AMQP 1.0
- * AMQP 0-9-1
- * [RabbitMQ Stream Protocol](https://www.rabbitmq.com/docs/streams)
- * MQTT 3.1, 3.1.1, and 5.0
- * STOMP 1.0 through 1.2
- * [MQTT over WebSocket](https://www.rabbitmq.com/docs/web-mqtt)
- * [STOMP over WebSocket](https://www.rabbitmq.com/docs/web-stomp)
- * AMQP 1.0 over WebSocket (supported in [VMware Tanzu RabbitMQ](https://www.vmware.com/products/app-platform/tanzu-rabbitmq))
+Author: **Bryan Fred, Unitek Systems Limited, Bedford, United Kingdom.**
+First commit: **2026-06-04 17:45 UTC.**
 
+---
 
-## Installation
+## What this repository is
 
- * [Currently supported](https://www.rabbitmq.com/release-information) released series
- * [Installation guides](https://www.rabbitmq.com/docs/download) for various platforms
- * [Kubernetes Cluster Operator](https://www.rabbitmq.com/kubernetes/operator/operator-overview)
- * [Changelog](https://www.rabbitmq.com/release-information)
- * [Releases](https://github.com/rabbitmq/rabbitmq-server/releases) on GitHub
- * [Community Support Eligibility Policy](https://github.com/rabbitmq/rabbitmq-server/blob/main/COMMUNITY_SUPPORT.md)
- * [Supported Erlang versions](https://www.rabbitmq.com/docs/which-erlang)
+`bryanunitek/UniSaaS.UniCORE.RabbitMQ` is the **RabbitMQ** family member: SaaS-deployment-shape public gift surface. Documentation today; source code at certification.
 
+**Family purpose:** Open-source message queue — async job processing, inter-service messaging for UniCORE.GVB.
 
-## Tutorials and Documentation
+**Deployment shape:** This is the **SaaS-shape** member of the family. It tracks the same upstream codebase as [`UniCORE.RabbitMQ`](https://github.com/bryanunitek/UniCORE.RabbitMQ) (on-prem shape) but carries SaaS-specific configuration, multi-tenant isolation patterns, and cloud-native deployment artefacts.
 
- * [RabbitMQ tutorials](https://www.rabbitmq.com/tutorials) and their [executable versions on GitHub](https://github.com/rabbitmq/rabbitmq-tutorials)
- * [Documentation guides](https://rabbitmq.com/docs/)
- * [RabbitMQ blog](https://blog.rabbitmq.com/)
+---
 
-Some key doc guides include
+## Upstream
 
- * [CLI tools guide](https://www.rabbitmq.com/docs/cli)
- * [Clustering](https://www.rabbitmq.com/docs/clustering) and [Cluster Formation](https://www.rabbitmq.com/docs/cluster-formation)
- * [Configuration guide](https://www.rabbitmq.com/docs/configure)
- * [Client libraries and tools](https://www.rabbitmq.com/client-libraries/devtools)
- * [Upgrading](https://www.rabbitmq.com/docs/upgrade)
- * [Kubernetes Cluster Operator](https://www.rabbitmq.com/kubernetes/operator/operator-overview)
- * [Quorum queues](https://www.rabbitmq.com/docs/quorum-queues): a replicated, data safety- and consistency-oriented queue type
- * [Streams](https://www.rabbitmq.com/docs/streams): a persistent and replicated append-only log with non-destructive consumer semantics
- * [Runtime Parameters](https://www.rabbitmq.com/docs/parameters)
- * [Policies](https://www.rabbitmq.com/docs/policies)
- * [Monitoring](https://www.rabbitmq.com/docs/monitoring) and [Prometheus/Grafana](https://www.rabbitmq.com/docs/prometheus)
- * [Production checklist](https://www.rabbitmq.com/docs/production-checklist)
+- **Upstream project:** https://github.com/rabbitmq/rabbitmq-server
+- **Upstream licence:** MPL-2.0
+- **Our relationship:** Fork-and-extend. Upstream codebase is consumed verbatim under its original licence; our additions sit on top under CC BY 4.0.
 
-RabbitMQ documentation is also [developed on GitHub](https://github.com/rabbitmq/rabbitmq-website/).
+The merge discipline that governs how this repository absorbs upstream changes is documented in [`UPSTREAM-MERGE-DISCIPLINE.md`](UPSTREAM-MERGE-DISCIPLINE.md).
 
-## Commercial Features and Support
+---
 
- * [Commercial editions of RabbitMQ](https://tanzu.vmware.com/rabbitmq)
- * [Commercial edition for Kubernetes](https://docs.vmware.com/en/VMware-RabbitMQ-for-Kubernetes/1/rmq/installation.html)
- * [Commercial support](https://tanzu.vmware.com/rabbitmq/oss) from [Broadcom](https://vmware.com) for open source RabbitMQ
+## Platforms
 
-## Getting Help from the Community
+Windows · Linux · macOS · iOS · Android
 
-Please read the [Community Support Eligibility Policy](https://github.com/rabbitmq/rabbitmq-server/blob/main/COMMUNITY_SUPPORT.md) document
-first.
+---
 
-The recommended community forums are
+## Family — the four-repo pattern
 
- * [GitHub Discussions](https://github.com/rabbitmq/rabbitmq-server/discussions/)
- * [Community Discord server](https://rabbitmq.com/discord/)
- * `#rabbitmq` on [Libera Chat](https://libera.chat/)
+UniCORE.RabbitMQ is published as a **four-repo family**:
 
+- `bryanunitek/UniCORE.RabbitMQ` — public on-prem-deployment-shape gift surface
+- `bryanunitek/UniSaaS.UniCORE.RabbitMQ` — public SaaS-deployment-shape gift surface ← **this repo**
+- `bryanunitek/UniCORE.RabbitMQ-Claw` (private) — on-prem-shape working repository
+- `bryanunitek/UniSaaS.UniCORE.RabbitMQ-Claw` (private) — SaaS-shape working repository
 
-## Contributing
+---
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) and our [development process overview](https://www.rabbitmq.com/github).
+## Status
 
-Questions about contributing, internals and so on are very welcome in [GitHub Discussions](https://github.com/rabbitmq/rabbitmq-server/discussions)
-or [community Discord server](https://www.rabbitmq.com/discord/) in the `contributors` channel.
+**SCAFFOLD-ANCHOR** as of 2026-06-04. See [`STATUS.md`](STATUS.md) for the full status breakdown.
 
+---
 
-## Licensing
+## Files in this scaffold commit
 
-RabbitMQ server is [licensed under the MPL 2.0](LICENSE-MPL-RabbitMQ).
+- [`README.md`](README.md) — this file
+- [`LICENSE.md`](LICENSE.md) — UniCORE additions licence
+- [`STATUS.md`](STATUS.md) — scaffold-anchor status
+- [`UPSTREAM-MERGE-DISCIPLINE.md`](UPSTREAM-MERGE-DISCIPLINE.md) — canonical merge discipline
+- [`AI-AUTHORSHIP.md`](AI-AUTHORSHIP.md) — AI authorship disclosure
 
-[Community Support Eligibility Policy](https://github.com/rabbitmq/rabbitmq-server/blob/main/COMMUNITY_SUPPORT.md)
-document explains the open source RabbitMQ support policy adopted by the RabbitMQ Core Team.
+---
 
+## Related repositories — UniCORE programme
 
-## AI Agent Instructions
+**Foundation triad (gift, public, CC BY 4.0):**
+- [`UniVERSE`](https://github.com/bryanunitek/UniVERSE) — programme
+- [`TrueAI`](https://github.com/bryanunitek/TrueAI) — Foundation (Nine Invariants)
+- [`UniCORE-AI`](https://github.com/bryanunitek/UniCORE-AI) — reference architecture (12 Levels)
 
-See `AGENTS.md`.
+**Implementation reference (deployment-shape pair):**
+- [`UniCORE`](https://github.com/bryanunitek/UniCORE) — on-prem-shape
+- [`UniSaaS.UniCORE`](https://github.com/bryanunitek/UniSaaS.UniCORE) — SaaS-shape
 
+**Substrate-services layer (deployment-shape pair):**
+- [`UniCORE.GVB`](https://github.com/bryanunitek/UniCORE.GVB) — on-prem-shape
+- [`UniSaaS.UniCORE.GVB`](https://github.com/bryanunitek/UniSaaS.UniCORE.GVB) — SaaS-shape
 
-## Building From Source and Packaging
+---
 
- * [Contributor resources](https://github.com/rabbitmq/contribute)
- * [Building RabbitMQ from Source](https://www.rabbitmq.com/docs/build-server)
- * [Building RabbitMQ Distribution Packages](https://www.rabbitmq.com/docs/build-server)
+## Contact
 
+- **Public discussion:** [GitHub Discussions](https://github.com/bryanunitek/UniSaaS.UniCORE.RabbitMQ/discussions)
+- **Private contact / connection request:** [LinkedIn — Bryan Fred](https://www.linkedin.com/in/bryan-fred-02209753/)
 
-## Copyright
+---
 
-(c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.
+*Author: Bryan Fred, Unitek Systems Limited, Bedford, United Kingdom. Public. Given, not sold. Irrevocable.*
