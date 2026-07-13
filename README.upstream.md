@@ -69,7 +69,7 @@ The recommended community forums are
 
 ## Contributing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) and our [development process overview](https://www.rabbitmq.com/github).
+See [CONTRIBUTING.md](https://git.unitek-systems.com/UniCORE/UniSaaS.UniCORE.RabbitMQ/src/branch/main/CONTRIBUTING.md) (mirror: [GitHub](https://github.com/bryanunitek/UniSaaS.UniCORE.RabbitMQ/blob/main/CONTRIBUTING.md)) and our [development process overview](https://www.rabbitmq.com/github).
 
 Questions about contributing, internals and so on are very welcome in [GitHub Discussions](https://github.com/rabbitmq/rabbitmq-server/discussions)
 or [community Discord server](https://www.rabbitmq.com/discord/) in the `contributors` channel.
