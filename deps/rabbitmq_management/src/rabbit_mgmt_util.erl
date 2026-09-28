@@ -20,7 +20,7 @@
 -export([user/1]).
 -export([bad_request/3, bad_request/4, service_unavailable/3, bad_request_exception/4,
          internal_server_error/3, internal_server_error/4, precondition_failed/3,
-         id/2, parse_bool/1, parse_int/1, redirect_to_home/3]).
+         id/2, parse_bool/1, parse_int/1, redirect_to_home/3, timeout/2]).
 -export([with_decode/4, with_ids/4, not_found/3]).
 -export([with_channel/4, with_channel/5]).
 -export([props_to_method/2, props_to_method/4]).
@@ -70,6 +70,9 @@
 -define(MAX_RANGE, 500).
 -define(MAX_FILTER_LENGTH, 1024).
 
+%% Erlang's own ceiling for a receive/gen_server/gen_event/rpc timeout value.
+-define(MAX_HTTP_TIMEOUT, 4294967295).
+
 -record(pagination, {page = undefined, page_size = undefined,
                      name = undefined, use_regex = undefined}).
 
@@ -99,8 +102,7 @@ is_authorized_admin(ReqData, Context, Token) ->
     AuthConfig = auth_config(),
     rabbit_web_dispatch_access_control:is_authorized(
       ReqData, Context,
-      AuthConfig#auth_settings.oauth_client_id,
-      Token, <<"Not administrator user">>,
+      <<"">>, Token, <<"Not administrator user">>,
       fun(#user{tags = Tags}) ->
               rabbit_web_dispatch_access_control:is_admin(Tags)
       end, AuthConfig).
@@ -134,13 +136,29 @@ is_authorized_vhost_visible_for_monitoring(ReqData, Context) ->
 
 auth_config() ->
     BasicAuthEnabled = not get_bool_env(rabbitmq_management, disable_basic_auth, false),
-    OauthEnabled = get_bool_env(rabbitmq_management, oauth_enabled, false),
-    OauthClientId = rabbit_data_coercion:to_binary(
-                        application:get_env(rabbitmq_management, oauth_client_id, "")),
-    #auth_settings{auth_realm = ?AUTH_REALM,
-                   basic_auth_enabled = BasicAuthEnabled,
-                   oauth2_enabled = OauthEnabled,
-                   oauth_client_id = OauthClientId}.
+    BearerTokenParser =
+        case application:get_env(rabbitmq_management, credential_encryption_secret, undefined) of
+            undefined -> undefined;
+            Secret ->
+                Key = rabbit_mgmt_basic_credentials_token:derive_key(Secret),
+                fun(Token) ->
+                    case rabbit_mgmt_basic_credentials_token:verify(Token, Key) of
+                        {ok, U, P, ExpiresAt} ->
+                            Now = erlang:system_time(second),
+                            if
+                                Now >= ExpiresAt ->
+                                    {error, <<"Invalid token: expired">>};
+                                true ->
+                                    {basic, U, P}
+                            end;
+                        {error, not_an_encrypted_token} -> {bearer, Token};
+                        {error, _Reason}                -> {error, <<"Invalid token">>}
+                    end
+                end
+        end,
+    #auth_settings{auth_realm          = ?AUTH_REALM,
+                   basic_auth_enabled  = BasicAuthEnabled,
+                   bearer_token_parser = BearerTokenParser}.
 
 disable_stats() ->
     not rabbit_mgmt_agent_config:is_metrics_collector_enabled() orelse
@@ -1052,8 +1070,8 @@ with_channel(VHost, ReqData,
                     bad_request_exception(Code, Reason, ReqData, Context)
             after
             erlang:unlink(Conn),
-            catch amqp_channel:close(Ch),
-            catch amqp_connection:close(Conn)
+            _ = try amqp_channel:close(Ch) catch _:_ -> ok end,
+            _ = try amqp_connection:close(Conn) catch _:_ -> ok end
             end;
         {error, {auth_failure, Msg}} ->
             not_authorised(Msg, ReqData, Context);
@@ -1091,7 +1109,10 @@ filter_vhost({vhost, _VHost}, _IsAdmin=true, List, _ReqData, _Context) ->
     [I || I <- List, lists:member(pget(vhost, I), rabbit_vhost:list())];
 filter_vhost({vhost, VHost}, _IsAdmin=false, List, ReqData, #context{user = User}) ->
     AuthzData = get_authz_data(ReqData),
-    case catch rabbit_access_control:check_vhost_access(User, VHost, AuthzData, #{}) of
+    Res = try rabbit_access_control:check_vhost_access(User, VHost, AuthzData, #{})
+          catch _:E -> {error, E}
+          end,
+    case Res of
         ok ->
             [I || I <- List, pget(vhost, I) =:= VHost];
         NotOK ->
@@ -1185,24 +1206,35 @@ list_visible_vhosts(User = #user{tags = Tags}, AuthzData) ->
 
 list_login_vhosts_names(User, AuthzData) ->
     [V || V <- rabbit_vhost:list_names(),
-          case catch rabbit_access_control:check_vhost_access(User, V, AuthzData, #{}) of
-              ok -> true;
-              NotOK ->
-                  log_access_control_result(NotOK),
-                  false
+          begin
+              Res = try rabbit_access_control:check_vhost_access(User, V, AuthzData, #{})
+                    catch _:E -> {error, E}
+                    end,
+              case Res of
+                  ok -> true;
+                  NotOK ->
+                      log_access_control_result(NotOK),
+                      false
+              end
           end].
 
 list_login_vhosts(User, AuthzData) ->
     [V || V <- rabbit_vhost:all(),
-          case catch rabbit_access_control:check_vhost_access(User, vhost:get_name(V), AuthzData, #{}) of
-              ok -> true;
-              NotOK ->
-                  log_access_control_result(NotOK),
-                  false
+          begin
+              Res = try rabbit_access_control:check_vhost_access(
+                            User, vhost:get_name(V), AuthzData, #{})
+                    catch _:E -> {error, E}
+                    end,
+              case Res of
+                  ok -> true;
+                  NotOK ->
+                      log_access_control_result(NotOK),
+                      false
+              end
           end].
 
 % rabbitmq/rabbitmq-auth-backend-http#100
-log_access_control_result({'EXIT', #amqp_error{name = Name, explanation = Msg}}) ->
+log_access_control_result({error, #amqp_error{name = Name, explanation = Msg}}) ->
     ?LOG_DEBUG("rabbit_access_control:check_vhost_access result: '~tp', ~ts", [Name, Msg]);
 log_access_control_result(NotOK) ->
     ?LOG_DEBUG("rabbit_access_control:check_vhost_access result: ~tp", [NotOK]).
@@ -1281,10 +1313,27 @@ ceil(X) ->
 int(Name, ReqData) ->
     case qs_val(list_to_binary(Name), ReqData) of
         undefined -> undefined;
-        Bin       -> case catch list_to_integer(binary_to_list(Bin)) of
-                         {'EXIT', _} -> undefined;
-                         Integer     -> Integer
+        Bin       -> try list_to_integer(binary_to_list(Bin)) of
+                         Integer -> Integer
+                     catch
+                         _:_ -> undefined
                      end
+    end.
+
+%% Parses the "timeout" request header, used by the various health check
+%% endpoints. Throws {error, {not_integer, Val}} for a value that isn't a
+%% valid receive/gen_server/gen_event/rpc timeout, same as parse_int/1 does
+%% for a non-numeric one, so callers only need a single catch clause.
+timeout(ReqData, Default) ->
+    case cowboy_req:header(<<"timeout">>, ReqData) of
+        undefined -> Default;
+        Val ->
+            case parse_int(Val) of
+                Timeout when Timeout >= 0, Timeout =< ?MAX_HTTP_TIMEOUT ->
+                    Timeout;
+                _ ->
+                    throw({error, {not_integer, Val}})
+            end
     end.
 
 -spec qs_val(binary(), cowboy_req:req()) -> any() | undefined.

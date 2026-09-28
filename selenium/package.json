@@ -6,11 +6,14 @@
   "scripts": {
     "fakeportal": "node fakeportal/app.js",
     "fakeproxy": "node fakeportal/proxy.js",
-    "test": ". $ENV_FILE && mocha --recursive --trace-warnings --timeout 40000"
+    "test": ". $ENV_FILE && mocha --trace-warnings --timeout 40000"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
+  "overrides": {
+    "proxy-agent": "6.5.0"
+  },
   "dependencies": {
     "amqplib": "2.0.1",
     "chromedriver": "^151.0.0",

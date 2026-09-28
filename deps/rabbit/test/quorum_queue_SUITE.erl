@@ -124,7 +124,8 @@ groups() ->
                                             replica_states,
                                             restart_after_queue_reincarnation,
                                             no_messages_after_queue_reincarnation,
-                                            consumer_message_is_delevered_after_snapshot
+                                            consumer_message_is_delevered_after_snapshot,
+                                            mixed_version_local_queries
                                            ]
                        ++ all_tests()},
                       {cluster_size_5, [], [start_queue,
@@ -2137,18 +2138,18 @@ dont_leak_file_handles(Config) ->
      end || _ <- Servers],
     flush(1),
     [{_, MonBy2}] = rpc:call(Server0, erlang, process_info, [NCh1, [monitored_by]]),
-    NumMonRefsBefore = length([M || M <- MonBy2, is_reference(M)]),
+    RefsBefore = sets:from_list([M || M <- MonBy2, is_reference(M)]),
     %% delete queue
     ?assertMatch(#'queue.delete_ok'{},
                  amqp_channel:call(Ch, #'queue.delete'{queue = QQ})),
     %% File handle monitors are cleaned up asynchronously after queue
-    %% deletion. Poll until the reference monitor count decreases.
+    %% deletion. Poll until none of the monitors seen above are left.
     ?awaitMatch(
        true,
        begin
            [{_, MonBy3}] = rpc:call(Server0, erlang, process_info, [NCh1, [monitored_by]]),
-           NumMonRefsAfter = length([M || M <- MonBy3, is_reference(M)]),
-           NumMonRefsAfter < NumMonRefsBefore
+           RefsAfter = sets:from_list([M || M <- MonBy3, is_reference(M)]),
+           sets:is_empty(sets:intersection(RefsBefore, RefsAfter))
        end,
        30_000),
 
@@ -3148,6 +3149,9 @@ recover_from_multiple_failures(Config) ->
     publish(Ch, QQ),
     publish(Ch, QQ),
     publish(Ch, QQ),
+    %% The publishes above are not yet confirmed. They cannot be committed once the
+    %% second node is stopped below.
+    wait_for_messages_ready([Server], RaName, 3),
 
     ok = rabbit_ct_broker_helpers:stop_node(Config, Server2),
     assert_cluster_status({Servers, Servers, [Server]}, [Server]),
@@ -4848,6 +4852,47 @@ status(Config) ->
                         rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_queue_type_ra,
                                                      status, [<<"/">>, QQ])),
     wait_for_messages(Config, [[QQ, <<"2">>, <<"2">>, <<"0">>]]),
+    ok.
+
+%% Only meaningful in a mixed-version cluster test. Since the queue's
+%% group spans all three nodes, its machine version stays pinned to
+%% whatever the oldest member supports, so local queries from the first
+%% node must still succeed instead of crashing with function_clause
+%% against that older state shape.
+mixed_version_local_queries(Config) ->
+    case rabbit_ct_helpers:is_mixed_versions() of
+        false ->
+            {skip, "mixed_version_local_queries only relevant in mixed version mode"};
+        true ->
+            mixed_version_local_queries0(Config)
+    end.
+
+mixed_version_local_queries0(Config) ->
+    [Server0 | _] = Nodes = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server0),
+    QQ = ?config(queue_name, Config),
+    RaName = ra_name(QQ),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                  {<<"x-quorum-initial-group-size">>, long, 3}])),
+    ?awaitMatch({ok, Members, _} when length(Members) == 3,
+                ra:members({RaName, Server0}),
+                ?DEFAULT_AWAIT),
+
+    publish(Ch, QQ),
+    wait_for_messages_ready(Nodes, RaName, 1),
+
+    [begin
+         ServerId = {RaName, Node},
+         [?assertMatch({ok, _, _},
+                       rabbit_ct_broker_helpers:rpc(
+                         Config, 0, rabbit_fifo_client, local_query,
+                         [ServerId, QueryFun, 5000]))
+          || QueryFun <- [query_notify_decorators_info,
+                          query_consumers,
+                          query_stat]]
+     end || Node <- Nodes],
     ok.
 
 status_noproc(Config) ->

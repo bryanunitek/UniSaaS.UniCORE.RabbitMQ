@@ -38,6 +38,7 @@ convert_from_legacy(Config) ->
     validate_uris(brokers, DUris),
     Q = get_value(queue, Config),
     DA = proplists:get_value(delete_after, Config, never),
+    DAD = proplists:get_value(delete_after_duration, Config, undefined),
     Pref = proplists:get_value(prefetch_count, Config, ?DEFAULT_PREFETCH),
     RD = proplists:get_value(reconnect_delay, Config, ?DEFAULT_RECONNECT_DELAY),
     AckMode = proplists:get_value(ack_mode, Config, ?DEFAULT_ACK_MODE),
@@ -55,6 +56,7 @@ convert_from_legacy(Config) ->
                {declarations, SourceDecls},
                {queue, Q},
                {delete_after, DA},
+               {delete_after_duration, DAD},
                {prefetch_count, Pref}]},
      {destination, [{protocol, amqp091},
                     {uris, DUris},
@@ -119,8 +121,8 @@ validate_uris0([Uri | Uris]) ->
     case amqp_uri:parse(Uri) of
         {ok, _Params} ->
             validate_uris0(Uris);
-        {error, _} = Err ->
-            throw(Err)
+        {error, {Reason, _Uri}} ->
+            throw({error, Reason})
     end;
 validate_uris0([]) -> ok.
 

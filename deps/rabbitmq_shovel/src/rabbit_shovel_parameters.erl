@@ -14,7 +14,7 @@
 
 -export([validate/5, notify/5, notify_clear/4]).
 -export([register/0, unregister/0, parse/3]).
--export([obfuscate_uris_in_definition/1]).
+-export([obfuscate_uris_in_definition/1, redact_uris_in_definition/1]).
 -export([src_protocol/1, dest_protocol/1, protocols/1]).
 -export([is_internal/1, internal_owner/1]).
 
@@ -109,6 +109,27 @@ obfuscate_uris_in_definition(Def) ->
   ObfuscatedDef = pset(<<"dest-uri">>, rabbit_shovel_util:obfuscate_uris(DestURIs), ObfuscatedSrcURIsDef),
   ObfuscatedDef.
 
+redact_uris_in_definition(Def) when is_map(Def) ->
+    maps:map(fun redact_uri_field/2, Def);
+redact_uris_in_definition(Def) when is_list(Def) ->
+    lists:map(fun ({Key, Value}) -> {Key, redact_uri_field(Key, Value)};
+                  (Other)        -> Other
+              end, Def).
+
+redact_uri_field(Key, Value) when Key =:= <<"src-uri">>;
+                                  Key =:= <<"dest-uri">> ->
+    redact_uris(Value);
+redact_uri_field(_Key, Value) ->
+    Value.
+
+redact_uris(URI) when is_binary(URI) ->
+    redact_uri(URI);
+redact_uris(URIs) when is_list(URIs) ->
+    [redact_uri(URI) || URI <- URIs].
+
+redact_uri(URI) ->
+    rabbit_data_coercion:to_binary(amqp_uri:remove_credentials(URI)).
+
 shovel_validation() ->
     AllProtocols = list_all_protocols(),
     [{<<"internal">>, fun rabbit_parameter_validation:boolean/2, optional},
@@ -163,11 +184,31 @@ protocols(Def) ->
     Dst = dest_protocol(Def),
     {Src, Dst}.
 
-registered_protocol_to_atom(Protocol) when is_atom(Protocol) -> Protocol;
-registered_protocol_to_atom(<<"amqp091">>)                  -> amqp091;
-registered_protocol_to_atom(<<"amqp10">>)                   -> amqp10;
-registered_protocol_to_atom(<<"local">>)                    -> local;
-registered_protocol_to_atom(_)                              -> amqp091.
+registered_protocol_to_atom(Protocol) when is_atom(Protocol) ->
+    Protocol;
+registered_protocol_to_atom(Protocol) when is_binary(Protocol) ->
+    case lookup_registered_protocol(Protocol) of
+        {ok, Registered}   -> Registered;
+        {error, not_found} -> builtin_protocol_to_atom(Protocol)
+    end;
+registered_protocol_to_atom(_) ->
+    amqp091.
+
+lookup_registered_protocol(Protocol) ->
+    try
+        Atom = binary_to_existing_atom(Protocol),
+        case rabbit_registry:lookup_module(shovel_protocol, Atom) of
+            {ok, _Mod}         -> {ok, Atom};
+            {error, not_found} -> {error, not_found}
+        end
+    catch
+        error:badarg -> {error, not_found}
+    end.
+
+builtin_protocol_to_atom(<<"amqp091">>) -> amqp091;
+builtin_protocol_to_atom(<<"amqp10">>)  -> amqp10;
+builtin_protocol_to_atom(<<"local">>)   -> local;
+builtin_protocol_to_atom(_)             -> amqp091.
 
 %%----------------------------------------------------------------------------
 

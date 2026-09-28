@@ -95,7 +95,8 @@ module.exports = {
     }
     let chromeCapabilities = Capabilities.chrome();
     const options = new chrome.Options()
-    chromeCapabilities.setAcceptInsecureCerts(true);  
+    chromeCapabilities.setAcceptInsecureCerts(true);
+    chromeCapabilities.set('goog:loggingPrefs', { browser: 'SEVERE' });
     let seleniumArgs = [
       "--window-size=1920,1080",
       "--enable-automation",
@@ -226,9 +227,8 @@ module.exports = {
     captureScreen._suppressTeardownFailureShot = true
   },
 
-  doUntil: async (doCallback, booleanCallback, delayMs = 1000, message = "doUntil failed") => {
+  doUntil: async (doCallback, booleanCallback, delayMs = 1000, message = "doUntil failed", attempts = 10) => {
     let done = false 
-    let attempts = 10
     let ret
     let lastError
     do {
@@ -366,13 +366,16 @@ module.exports = {
   },
 
   teardown: async (d, test, captureScreen = null) => {    
-    let driver = d.driver
-    driver.manage().logs().get(logging.Type.BROWSER).then(function(entries) {
-        entries.forEach(function(entry) {
-          module.exports.log('[%s] %s', entry.level.name, entry.message);
-        })
-     })
-    if (test.currentTest) {
+    let driver = d.driver || d
+    try {
+      const entries = await driver.manage().logs().get(logging.Type.BROWSER)
+      entries.forEach(function (entry) {
+        module.exports.log('[browser:%s] %s', entry.level.name, entry.message)
+      })
+    } catch (e) {
+      // Not every driver exposes the browser log; never fail teardown over it.
+    }
+    if (test && test.currentTest) {
       if (test.currentTest.isPassed()) {
         driver.executeScript('lambda-status=passed')
       } else {        

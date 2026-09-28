@@ -166,6 +166,11 @@ handle_info({bump_credit, Msg}, State) ->
 handle_info(client_timeout, State) ->
     {stop, {shutdown, client_heartbeat_timeout}, State};
 
+handle_info(credential_expired, State) ->
+    ProcState = processor_state(State),
+    NewProcState = rabbit_stomp_processor:send_credential_expired_error(ProcState),
+    {stop, {shutdown, credential_expired}, processor_state(NewProcState, State)};
+
 handle_info(login_timeout, State) ->
     ProcState = processor_state(State),
     case rabbit_stomp_processor:info(channel, ProcState) of
@@ -219,7 +224,7 @@ handle_info({start_heartbeats, {0, 0}}, State) ->
 handle_info({start_heartbeats, {SendTimeout, ReceiveTimeout}},
             State = #reader_state{heartbeat_sup = SupPid, socket = Sock}) ->
 
-    SendFun = fun() -> catch rabbit_net:send(Sock, <<$\n>>) end,
+    SendFun = fun() -> try rabbit_net:send(Sock, <<$\n>>) catch _:_ -> ok end end,
     Pid = self(),
     ReceiveFun = fun() -> gen_server2:cast(Pid, client_timeout) end,
     Heartbeat = rabbit_heartbeat:start(SupPid, Sock, SendTimeout,
@@ -256,12 +261,17 @@ process_received_bytes(Bytes,
                          current_frame_size = FrameLength,
                          processor_state  = ProcState,
                          parse_state      = ParseState}) ->
+    EffectiveMaxFrameSize =
+        case rabbit_stomp_processor:is_authenticated(ProcState) of
+            true  -> MaxFrameSize;
+            false -> min(MaxFrameSize, ?DEFAULT_MAX_FRAME_SIZE_UNAUTHENTICATED)
+        end,
     case rabbit_stomp_frame:parse(Bytes, ParseState) of
         {more, ParseState1} ->
             FrameLength1 = FrameLength + byte_size(Bytes),
-            case FrameLength1 > MaxFrameSize of
+            case FrameLength1 > EffectiveMaxFrameSize of
                 true ->
-                    log_reason({network_error, {frame_too_big, {FrameLength1, MaxFrameSize}}}, State),
+                    log_reason({network_error, {frame_too_big, {FrameLength1, EffectiveMaxFrameSize}}}, State),
                     {stop, normal, State};
                 false ->
                     {ok, State#reader_state{parse_state = ParseState1,
@@ -269,9 +279,9 @@ process_received_bytes(Bytes,
             end;
         {ok, Frame, Rest} ->
             FrameLength1 = FrameLength + byte_size(Bytes) - byte_size(Rest),
-            case FrameLength1 > MaxFrameSize of
+            case FrameLength1 > EffectiveMaxFrameSize of
                 true ->
-                    log_reason({network_error, {frame_too_big, {FrameLength1, MaxFrameSize}}}, State),
+                    log_reason({network_error, {frame_too_big, {FrameLength1, EffectiveMaxFrameSize}}}, State),
                     {stop, normal, State};
                 false ->
                     try rabbit_stomp_processor:process_frame(Frame, ProcState) of
@@ -392,6 +402,11 @@ log_reason({shutdown, client_heartbeat_timeout},
     AdapterName = rabbit_stomp_processor:adapter_name(ProcState),
     ?LOG_WARNING("STOMP detected missed client heartbeat(s) "
                                   "on connection ~ts, closing it", [AdapterName]);
+
+log_reason({shutdown, credential_expired},
+           #reader_state{conn_name = ConnName}) ->
+    ?LOG_WARNING("closing STOMP connection ~tp (~ts): credential has expired",
+                 [self(), ConnName]);
 
 log_reason({shutdown, {server_initiated_close, Reason}},
            #reader_state{conn_name = ConnName}) ->

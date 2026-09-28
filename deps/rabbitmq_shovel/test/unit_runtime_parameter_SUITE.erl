@@ -21,7 +21,8 @@
 
 all() ->
     [
-      {group, tests}
+      {group, tests},
+      {group, registry}
     ].
 
 groups() ->
@@ -45,6 +46,9 @@ groups() ->
           test_protocols_explicit,
           test_protocols_mixed,
           test_protocols_with_maps
+        ]},
+      {registry, [], [
+          custom_registered_protocol
         ]}
     ].
 
@@ -102,6 +106,7 @@ parse_amqp091_maps_0() ->
                                       <<"delivery_mode">> => 2}},
          {<<"ack-mode">>, <<"on-publish">>},
          {<<"src-delete-after">>, <<"queue-length">>},
+         {<<"src-delete-after-duration">>, 1002},
          {<<"prefetch-count">>, 30},
          {<<"reconnect-delay">>, 1001},
          {<<"src-queue">>, <<"a-src-queue">>},
@@ -125,6 +130,7 @@ parse_amqp091_proplists_0() ->
                                           {<<"delivery_mode">>, 2}]},
          {<<"ack-mode">>, <<"on-publish">>},
          {<<"src-delete-after">>, <<"queue-length">>},
+         {<<"src-delete-after-duration">>, 1002},
          {<<"src-prefetch-count">>, 30},
          {<<"reconnect-delay">>, 1001},
          {<<"src-queue">>, <<"a-src-queue">>},
@@ -190,7 +196,8 @@ test_parse_amqp091(Params) ->
                   uris := [{encrypted, _}],
                   prefetch_count := 30,
                   queue := <<"a-src-queue">>,
-                  delete_after := 'queue-length'}
+                  delete_after := 'queue-length',
+                  delete_after_duration := 1002}
      } = Result,
     assert_uris_round_trip(Result,
                            ["amqp://localhost:5672"],
@@ -219,7 +226,8 @@ test_parse_amqp091_with_blank_proprties(Params) ->
                   uris := [{encrypted, _}],
                   prefetch_count := 30,
                   queue := <<"a-src-queue">>,
-                  delete_after := 'queue-length'}
+                  delete_after := 'queue-length',
+                  delete_after_duration := undefined}
      } = Result,
     assert_uris_round_trip(Result,
                            ["amqp://localhost:5672"],
@@ -406,6 +414,44 @@ validate_amqp10_with_a_map_0() ->
                                                 "my-shovel", Params, none),
         [] = validate_ok(Res),
         ok.
+
+custom_registered_protocol(Config) ->
+    rabbit_ct_broker_helpers:add_code_path_to_all_nodes(
+      Config, dummy_shovel_protocol),
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, rabbit_registry, register,
+           [shovel_protocol, <<"dummy">>, dummy_shovel_protocol]),
+    try
+        ok = rabbit_ct_broker_helpers:rpc(
+               Config, 0, ?MODULE, custom_registered_protocol0, [])
+    after
+        ok = rabbit_ct_broker_helpers:rpc(
+               Config, 0, rabbit_registry, unregister,
+               [shovel_protocol, <<"dummy">>])
+    end.
+
+custom_registered_protocol0() ->
+    Params = [{<<"src-protocol">>, <<"dummy">>},
+              {<<"src-dummy-target">>, <<"a-src-target">>},
+              {<<"dest-protocol">>, <<"dummy">>},
+              {<<"dest-dummy-target">>, <<"a-dest-target">>}],
+
+    ?assertEqual(dummy, rabbit_shovel_parameters:src_protocol(Params)),
+    ?assertEqual(dummy, rabbit_shovel_parameters:dest_protocol(Params)),
+    ?assertEqual({dummy, dummy}, rabbit_shovel_parameters:protocols(Params)),
+
+    Res = rabbit_shovel_parameters:validate(<<"my-vhost">>, <<"shovel">>,
+                                            <<"my-shovel">>, Params, none),
+    [] = validate_ok(Res),
+
+    {ok, Parsed} = rabbit_shovel_parameters:parse({<<"my-vhost">>, <<"my-shovel">>},
+                                                  my_cluster, Params),
+    ?assertMatch(#{source := #{module := dummy_shovel_protocol,
+                               dummy_target := <<"a-src-target">>},
+                   dest := #{module := dummy_shovel_protocol,
+                             dummy_target := <<"a-dest-target">>}},
+                 Parsed),
+    ok.
 
 validate_ok([ok | T]) ->
     validate_ok(T);

@@ -1,6 +1,6 @@
 const { By, Key, until, Builder } = require('selenium-webdriver')
 const assert = require('assert')
-const { buildDriver, goToHome, captureScreensFor, teardown, delay } = require('../utils')
+const { buildDriver, goToHome, captureScreensFor, teardown, doUntil } = require('../utils')
 
 const LoginPage = require('../pageobjects/LoginPage')
 const OverviewPage = require('../pageobjects/OverviewPage')
@@ -21,8 +21,8 @@ describe('An user without management tag', function () {
   })
 
   it('cannot log in into the management ui', async function () {    
-    const visible = await login.isWarningVisible()
-    assert.ok(visible)
+    const notVisible = await login.isWarningNotVisible()
+    assert.ok(!notVisible)
   })
 
   it('should get "Login failed" warning message', async function(){
@@ -41,7 +41,12 @@ describe('An user without management tag', function () {
       })
 
       it('should close popup warning', async function(){
-        await delay(1000)        
+        await doUntil(
+          () => login.isPopupWarningNotDisplayed(),
+          (v) => !!v,
+          500,
+          'Popup warning was not closed'
+        )
         assert.ok(await login.isPopupWarningNotDisplayed())
       })
 

@@ -13,6 +13,10 @@ define PROJECT_ENV
 	    {retained_message_store, rabbit_mqtt_retained_msg_store_dets},
 	    %% only used by DETS store
 	    {retained_message_store_dets_sync_interval, 2000},
+	    %% per virtual host limits, both accept 'infinity'
+	    {retained_message_store_max_messages, 100000},
+	    %% 1 GB
+	    {retained_message_store_max_size_bytes, 1073741824},
 	    {prefetch, 10},
 	    {ssl_listeners, []},
 	    {tcp_listeners, [1883]},
@@ -46,10 +50,12 @@ LOCAL_DEPS = ssl
 DEPS = ranch rabbit amqp10_common
 TEST_DEPS = cowlib emqtt ct_helper rabbitmq_ct_helpers rabbitmq_ct_client_helpers rabbitmq_management amqp_client rabbitmq_consistent_hash_exchange rabbitmq_amqp_client rabbitmq_stomp rabbitmq_stream rabbitmq_federation
 
-PLT_APPS += rabbitmq_cli elixir
+PLT_APPS += rabbitmq_cli $(ELIXIR_ERL_EBIN)
 
 dep_ct_helper = git https://github.com/extend/ct_helper.git master
-dep_emqtt = git https://github.com/emqx/emqtt.git 1.14.6
+dep_emqtt = git https://github.com/emqx/emqtt.git 1.16.1
+
+ELIXIR = system
 
 CT_HOOKS = rabbit_ct_hook
 DEP_EARLY_PLUGINS = rabbit_common/mk/rabbitmq-early-plugin.mk
@@ -58,6 +64,9 @@ DEP_PLUGINS = rabbit_common/mk/rabbitmq-plugin.mk
 include ../../rabbitmq-components.mk
 include ../../erlang.mk
 
+ELIXIR_ERL_EBIN := $(shell dirname $$(elixir -e 'IO.puts(:code.which(:elixir_erl))' 2>/dev/null))
+DIALYZER_PLT_OPTS += -pa $(ELIXIR_ERL_EBIN)
+DIALYZER_OPTS += -pa $(ELIXIR_ERL_EBIN)
 
 clean::
 	if test -d test/java_SUITE_data; then cd test/java_SUITE_data && $(MAKE) clean; fi
@@ -97,7 +106,7 @@ define ct_master.erl
 endef
 
 PARALLEL_CT_SET_1_A = auth retainer federation disconnect_on_unauthorized
-PARALLEL_CT_SET_1_B = cluster command config config_schema mc_mqtt packet_prop \
+PARALLEL_CT_SET_1_B = cluster command config config_schema mc_mqtt packet_fragment packet_prop \
     processor protocol_interop proxy_protocol rabbit_mqtt_confirms reader util
 PARALLEL_CT_SET_1_C = java v5
 PARALLEL_CT_SET_1_D = mqtt_shared

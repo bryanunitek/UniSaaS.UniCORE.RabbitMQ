@@ -54,14 +54,14 @@ function removeDuplicates(array){
 
 function startWithOAuthLogin (oauth) {
   if (!oauth.logged_in) {
-    hasAnyResourceServerReady(oauth, (oauth, warnings) => {  render_login_oauth(oauth, warnings); start_app_login(); })
+    hasAnyResourceServerReady(oauth, (oauth, escaped_warnings) => {  render_login_oauth(oauth, escaped_warnings); start_app_login(); })
   } else {
     start_app_login()
   }
 }
-function render_login_oauth(oauth, messages) {
+function render_login_oauth(oauth, escaped_messages) {
   let formatData = {};
-  formatData.warnings = [];
+  formatData.escaped_warnings = [];
   formatData.notAuthorized = false;
   formatData.resource_servers = oauth.resource_servers;
   formatData.declared_resource_servers_count = oauth.declared_resource_servers_count;
@@ -69,11 +69,11 @@ function render_login_oauth(oauth, messages) {
   formatData.strict_auth_mechanism = oauth.strict_auth_mechanism || null;
   formatData.preferred_auth_mechanism = oauth.preferred_auth_mechanism || null;
 
-  if (Array.isArray(messages)) {
-    formatData.warnings = messages
-  } else if (typeof messages == "string") {
-    formatData.warnings = [messages]
-    formatData.notAuthorized = messages == "Not authorized"
+  if (Array.isArray(escaped_messages)) {
+    formatData.escaped_warnings = escaped_messages
+  } else if (typeof escaped_messages == "string") {
+    formatData.escaped_warnings = [escaped_messages]
+    formatData.notAuthorized = escaped_messages == "Not authorized"
   }
   replace_content('outer', format('login_oauth', formatData))
 
@@ -105,8 +105,7 @@ function start_app_login () {
     this.get('#/', function () {})
     if (!oauth.enabled || !oauth.oauth_disable_basic_auth) {
       this.put('#/login', function() {
-        set_basic_auth(this.params['username'], this.params['password'])
-        check_login()
+        login(this.params['username'], this.params['password']);
       });
     }
   })
@@ -136,34 +135,68 @@ function check_login () {
     }
     return false;
   }
-  check_version()
-  hide_popup_warn()
-  replace_content('outer', format('layout', {}))
-  var user_login_session_timeout = parseInt(user.login_session_timeout)
-  if (!isNaN(user_login_session_timeout)) {
-    update_login_session_timeout(user_login_session_timeout)
+  load_ui(user);
+  return true;
+}
+
+function do_login(username, password) {
+    var result = null;
+    $.ajax({
+        async: false,
+        type: 'POST',
+        url: 'api/login',
+        data: {username: username, password: password},
+        success: function(resp) { result = resp; },
+        error: function(xhr) {
+            try { result = JSON.parse(xhr.responseText); } catch(e) {}
+            if (!result) result = {error: 'login_failed', reason: 'Login failed'};
+        }
+    });
+    return result;
+}
+
+function login(username, password) {
+  var result = do_login(username, password);
+  if (!result || result.error) {
+    replace_content('login-status', '<p>Login failed</p>');
+    if (result && result.reason && typeof result.reason === 'string') {
+      show_popup('warn', fmt_escape_html(result.reason));
+    }
+    return false;
   }
+  user = result.user;
+  clear_local_pref(SESSION_EXPIRY);
+  var scheme = result.token.type === 'bearer' ? 'Bearer' : 'Basic';
+  set_auth(scheme, result.token.value);
+  
+  load_ui(user);
+  return true;
+}
+
+function load_ui(user) {
+  set_session_expiry_if_required(user.login_session_timeout);
+  check_version();
+  hide_popup_warn();
+  replace_content('outer', format('layout', {}));
 
   ui_data_model.vhosts = JSON.parse(sync_get('/vhosts'));
-  ac.update(user, ui_data_model)
+  ac.update(user, ui_data_model);
   if (ac.isMonitoringUser()) {
-    ui_data_model.nodes = JSON.parse(sync_get('/nodes'))
+    ui_data_model.nodes = JSON.parse(sync_get('/nodes'));
   }
-  var overview = JSON.parse(sync_get('/overview'))
+  var overview = JSON.parse(sync_get('/overview'));
 
-  display.update(overview, ui_data_model)
+  display.update(overview, ui_data_model);
 
-  setup_global_vars(overview)
+  setup_global_vars(overview);
 
-  setup_constant_events()
-  update_vhosts()
-  update_interval()
+  setup_constant_events();
+  update_vhosts();
+  update_interval();
   setup_extensions(function onCompleted() {
     console.info("All extensions have been loaded. Starting application ..");
     start_app();
   });
-
-  return true
 }
 
 
@@ -242,6 +275,13 @@ function setup_constant_events() {
 }
 
 function setup_form_events() {
+    // Only the page size input is restricted to digits.
+    // The name filter input, which shares the pagination_class_input class,
+    // should not be affected by this validation, otherwise the filter input
+    // will break with legitimate non-numerical inputs.
+    $(document).on('keypress', '.pagination_class_pagesize_input', function(e) {
+        return isNumberKey(e);
+    });
     $(document).on('click', '#ff-enable-all-button', function() {
         enable_all_stable_feature_flags(this);
     });
@@ -924,9 +964,9 @@ function postprocess() {
         select_queue_type(this);
     });
 
-    $('[name="upload-definitions"]').on('click', function(e) {
+    $('form[name="upload-definitions"]').on('submit', function(e) {
         e.preventDefault();
-        submit_import($(this).closest('form')[0]);
+        submit_import(this);
     });
 
     $(document).on('click', '.help', function() {
@@ -2059,7 +2099,9 @@ function change_own_password(sammy) {
         if (req.readyState == 4 && !done) {
             clearTimeout(timeout);
             if (req.status >= 200 && req.status < 300) {
-                set_basic_auth(username, new_password);
+                // Re-login via api/login so encrypted-credential mode stores
+                // a fresh token instead of plaintext Basic credentials.
+                login(username, new_password);
                 finish();
                 go_to('#/users');
             } else {

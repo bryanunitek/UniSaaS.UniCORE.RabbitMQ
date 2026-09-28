@@ -51,10 +51,15 @@ resource_exists(ReqData, Context) ->
      end, ReqData, Context}.
 
 to_json(ReqData, {Filter, Context}) ->
-    Chs = rabbit_mgmt_db:get_all_channels(
-            rabbit_mgmt_util:range(ReqData)),
-    rabbit_mgmt_util:reply_list(
-      filter_vhost(status(Chs, ReqData, Context, Filter), ReqData), ReqData, Context);
+    try
+        Chs = rabbit_mgmt_db:get_all_channels(
+                rabbit_mgmt_util:range(ReqData)),
+        rabbit_mgmt_util:reply_list(
+          filter_vhost(status(Chs, ReqData, Context, Filter), ReqData), ReqData, Context)
+    catch
+        {error, invalid_range_parameters, Reason} ->
+            rabbit_mgmt_util:bad_request(iolist_to_binary(Reason), ReqData, Context)
+    end;
 to_json(ReqData, Context) ->
     to_json(ReqData, {all, Context}).
 
@@ -131,27 +136,28 @@ print(Fmt, Val) ->
     list_to_binary(io_lib:format(Fmt, Val)).
 
 lookup(Id, ReqData) ->
-    try get_node(ReqData) of
-        Node ->
+    case rabbit_mgmt_nodes:node_name_from_req(ReqData) of
+        {ok, Node} ->
             case rpc:call(Node, rabbit_federation_status, lookup, [Id], infinity) of
                 {badrpc, _}  -> false;
                 not_found -> false;
                 _ -> true
-            end
-    catch
-        error:badarg -> false
+            end;
+        {error, _} ->
+            false
     end.
 
 restart(Id, ReqData) ->
-    Node = get_node(ReqData),
-    case rpc:call(Node, rabbit_federation_status, lookup, [Id], infinity) of
-        not_found -> false;
-        Obj ->
-            Upstream = proplists:get_value(upstream, Obj),
-            Supervisor = proplists:get_value(supervisor, Obj),
-            rpc:call(Node, rabbit_federation_link_sup, restart, [Supervisor, Upstream], infinity),
-            true
+    case rabbit_mgmt_nodes:node_name_from_req(ReqData) of
+        {ok, Node} ->
+            case rpc:call(Node, rabbit_federation_status, lookup, [Id], infinity) of
+                not_found -> false;
+                Obj ->
+                    Upstream = proplists:get_value(upstream, Obj),
+                    Supervisor = proplists:get_value(supervisor, Obj),
+                    rpc:call(Node, rabbit_federation_link_sup, restart, [Supervisor, Upstream], infinity),
+                    true
+            end;
+        {error, _} ->
+            false
     end.
-
-get_node(ReqData) ->
-    binary_to_existing_atom(rabbit_mgmt_util:id(node, ReqData), utf8).

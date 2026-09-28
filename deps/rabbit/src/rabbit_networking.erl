@@ -141,8 +141,18 @@ ensure_ssl() ->
     {ok, SslOptsConfig0} = application:get_env(rabbit, ssl_options),
     rabbit_ssl_options:fix(SslOptsConfig0).
 
+-spec fix_ssl_options(rabbit_types:infos()) -> rabbit_types:infos().
+
+%% Some plugins do not rely on the core `ssl_options`: management UI/HTTP API, Web MQTT, Web STOMP.
+%%
+%% The `ssl_options_overrides` option lets a plugin such as `rabbitmq_trust_store`
+%% "reach" to those plugins' listeners just like it can reach the core one,
+%% and do so without this core module depending on the plugin.
 fix_ssl_options(Config) ->
-    rabbit_ssl_options:fix(Config).
+    Overrides = application:get_env(rabbit, ssl_options_overrides, []),
+    rabbit_ssl_options:fix(
+      lists:foldl(fun({Key, Value}, Acc) -> rabbit_misc:pset(Key, Value, Acc) end,
+                  Config, Overrides)).
 
 -spec tcp_listener_addresses(listener_config()) -> [address()].
 
@@ -408,7 +418,7 @@ epmd_port_please(Name, Host, 0) ->
 epmd_port_please(Name, Host, RetriesLeft) ->
     ?LOG_DEBUG("Getting epmd port node '~ts', ~b retries left",
     [Name, RetriesLeft]),
-  case catch maybe_get_epmd_port(Name, Host) of
+  case try maybe_get_epmd_port(Name, Host) catch _:E -> {error, E} end of
     ok -> ok;
     {error, _} ->
       timer:sleep(?PORT_PLEASE_ATTEMPTS_WAIT),

@@ -9,7 +9,8 @@
 
 -compile({no_auto_import, [error/3]}).
 
--export([initial_state/2, process_frame/2, flush_and_die/1]).
+-export([initial_state/2, process_frame/2, flush_and_die/1, is_authenticated/1,
+         send_credential_expired_error/1]).
 -export([flush_pending_receipts/3,
          handle_exit/3,
          cancel_consumer/2,
@@ -160,6 +161,15 @@ initial_state(Configuration,
        default_topic_exchange = application:get_env(rabbitmq_stomp, default_topic_exchange, <<"amq.topic">>),
        default_nack_requeue = application:get_env(rabbitmq_stomp, default_nack_requeue, true)}.
 
+is_authenticated(#proc_state{connection = none}) -> false;
+is_authenticated(#proc_state{}) -> true.
+
+-spec send_credential_expired_error(#proc_state{}) -> #proc_state{}.
+send_credential_expired_error(State) ->
+    send_error("Credential expired",
+               "The credential used to authenticate this connection has expired",
+               State).
+
 
 command({"STOMP", Frame}, State) ->
     process_connect(no_implicit, Frame, State);
@@ -230,18 +240,16 @@ process_request(ProcessFun, State) ->
 
 
 process_request(ProcessFun, SuccessFun, State) ->
-    Res = case catch ProcessFun(State) of
-              {'EXIT',
-               {{shutdown,
-                 {server_initiated_close, ReplyCode, Explanation}}, _}} ->
+    Res = try ProcessFun(State) of
+              Result -> Result
+          catch
+              exit:{{shutdown, {server_initiated_close, ReplyCode, Explanation}}, _} ->
                   amqp_death(ReplyCode, Explanation, State);
-              {'EXIT', {amqp_error, access_refused, Msg, _}} ->
+              exit:{amqp_error, access_refused, Msg, _} ->
                   amqp_death(access_refused, Msg, State);
-              {'EXIT', Reason} ->
+              Class:Reason ->
                   priv_error("Processing error", "Processing error",
-                              Reason, State);
-              Result ->
-                  Result
+                             {Class, Reason}, State)
           end,
     case Res of
         {ok, Frame, NewState = #proc_state{connection = Conn}} ->
@@ -253,9 +261,7 @@ process_request(ProcessFun, SuccessFun, State) ->
         {error, Message, Detail, NewState = #proc_state{connection = Conn}} ->
             {ok, send_error(Message, Detail, NewState), Conn};
         {stop, normal, NewState} ->
-            {stop, normal, SuccessFun(NewState)};
-        {stop, R, NewState} ->
-            {stop, R, NewState}
+            {stop, normal, SuccessFun(NewState)}
     end.
 
 process_connect(Implicit, Frame,
@@ -580,6 +586,17 @@ without_headers([Hdr | Hdrs], Command, Frame, State, Fun) ->
 without_headers([], Command, Frame, State, Fun) ->
     Fun(Command, Frame, State).
 
+maybe_start_credential_expiry_timer(Connection) ->
+    [{internal_user, User}] = amqp_connection:info(Connection, [internal_user]),
+    case rabbit_access_control:expiry_timestamp(User) of
+        never ->
+            ok;
+        Ts when is_integer(Ts) ->
+            Time = (Ts - os:system_time(second)) * 1000,
+            _ = erlang:send_after(max(Time, 0), self(), credential_expired),
+            ok
+    end.
+
 do_login(undefined, _, _, _, _, _, State) ->
     error("Bad CONNECT", "Missing login or passcode header(s)", State);
 do_login(Username, Passwd, VirtualHost, Heartbeat, AdapterInfo, Version,
@@ -597,6 +614,7 @@ do_login(Username, Passwd, VirtualHost, Heartbeat, AdapterInfo, Version,
             amqp_channel:enable_delivery_flow_control(Channel),
             SessionId = rabbit_guid:string(rabbit_guid:gen_secure(), "session"),
             {SendTimeout, ReceiveTimeout} = ensure_heartbeats(Heartbeat),
+            ok = maybe_start_credential_expiry_timer(Connection),
 
           Headers = [{?HEADER_SESSION, SessionId},
                      {?HEADER_HEART_BEAT,
@@ -783,8 +801,8 @@ check_subscription_access(_, _) ->
 
 maybe_clean_up_queue(Queue, #proc_state{connection = Connection}) ->
     {ok, Channel} = amqp_connection:open_channel(Connection),
-    catch amqp_channel:call(Channel, #'queue.delete'{queue = Queue}),
-    catch amqp_channel:close(Channel),
+    try amqp_channel:call(Channel, #'queue.delete'{queue = Queue}) catch _:_ -> ok end,
+    try amqp_channel:close(Channel) catch _:_ -> ok end,
     ok.
 
 do_send(Destination, _DestHdr,
@@ -897,7 +915,7 @@ close_connection(State = #proc_state{connection = none}) ->
 %% Closing the connection will close the channel and subchannels
 close_connection(State = #proc_state{connection = Connection}) ->
     %% ignore noproc or other exceptions to avoid debris
-    catch amqp_connection:close(Connection),
+    try amqp_connection:close(Connection) catch _:_ -> ok end,
     State#proc_state{channel = none, connection = none, subscriptions = none};
 close_connection(undefined) ->
     ?LOG_DEBUG("~ts:close_connection: undefined state", [?MODULE]),

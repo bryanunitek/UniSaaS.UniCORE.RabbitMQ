@@ -286,10 +286,20 @@ unmapped(cast, {socket_ready, Socket}, State) ->
     State1 = State#state{socket = Socket},
     ok = send_begin(State1),
     {next_state, begin_sent, State1};
+unmapped(cast, 'end', State) ->
+    %% The frame reader has not made the socket available yet, so the peer
+    %% never learnt about this session and there is no end frame to send.
+    {stop, normal, State};
 unmapped({call, From}, {attach, Attach},
                       #state{early_attach_requests = EARs} = State) ->
     {keep_state,
-     State#state{early_attach_requests = [{From, Attach} | EARs]}}.
+     State#state{early_attach_requests = [{From, Attach} | EARs]}};
+unmapped(_EvtType, Msg, _State) ->
+    %% Crashing here would take down `amqp10_client_sessions_sup` with this
+    %% session, leaving the connection unable to begin any more sessions.
+    ?LOG_DEBUG("amqp10_session: unhandled msg in unmapped state ~W",
+               [Msg, 10]),
+    keep_state_and_data.
 
 begin_sent(cast, #'v1_0.begin'{remote_channel = {ushort, RemoteChannel},
                                next_outgoing_id = {uint, NOI},
@@ -310,10 +320,25 @@ begin_sent(cast, #'v1_0.begin'{remote_channel = {ushort, RemoteChannel},
                                       next_incoming_id = NOI,
                                       remote_incoming_window = InWindow,
                                       remote_outgoing_window = OutWindow}};
+begin_sent(cast, 'end', State) ->
+    %% The session was ended before the peer confirmed that it had begun.
+    send_end(State),
+    {next_state, end_sent, State};
+begin_sent(cast, #'v1_0.end'{} = End, State) ->
+    %% `send_end/1` stops this process when the socket is gone, so notify first.
+    ok = notify_session_ended(End, State),
+    _ = send_end(State),
+    {stop, normal, State};
 begin_sent({call, From}, {attach, Attach},
            #state{early_attach_requests = EARs} = State) ->
     {keep_state,
-     State#state{early_attach_requests = [{From, Attach} | EARs]}}.
+     State#state{early_attach_requests = [{From, Attach} | EARs]}};
+begin_sent(_EvtType, Msg, _State) ->
+    %% Crashing here would take down `amqp10_client_sessions_sup` with this
+    %% session, leaving the connection unable to begin any more sessions.
+    ?LOG_DEBUG("amqp10_session: unhandled msg in begin_sent state ~W",
+               [Msg, 10]),
+    keep_state_and_data.
 
 mapped(cast, 'end', State) ->
     %% We send the first end frame and wait for the reply.
@@ -334,23 +359,32 @@ mapped(cast, {flow_session, IncomingWindow, RenewWhenBelow}, State0) ->
 mapped(cast,
        {disposition, OutputHandle, First, Last, Settled0, DeliveryState},
        #state{links = Links} = State0) ->
-    #{OutputHandle := Link0 = #link{incoming_unsettled = Unsettled0}} = Links,
-    Unsettled = serial_number:foldl(fun maps:remove/2, Unsettled0, First, Last),
-    Link = Link0#link{incoming_unsettled = Unsettled},
-    State1 = State0#state{links = Links#{OutputHandle := Link}},
-    State = auto_flow(Link, State1),
-    Disp = #'v1_0.disposition'{role = ?AMQP_ROLE_RECEIVER,
-                               first = {uint, First},
-                               last = {uint, Last},
-                               settled = Settled0,
-                               state = translate_delivery_state(DeliveryState)},
-    ok = send(Disp, State),
-    {keep_state, State};
+    case Links of
+        #{OutputHandle := Link0 = #link{incoming_unsettled = Unsettled0}} ->
+            Unsettled = serial_number:foldl(fun maps:remove/2, Unsettled0, First, Last),
+            Link = Link0#link{incoming_unsettled = Unsettled},
+            State1 = State0#state{links = Links#{OutputHandle := Link}},
+            State = auto_flow(Link, State1),
+            Disp = #'v1_0.disposition'{role = ?AMQP_ROLE_RECEIVER,
+                                       first = {uint, First},
+                                       last = {uint, Last},
+                                       settled = Settled0,
+                                       state = translate_delivery_state(DeliveryState)},
+            ok = send(Disp, State),
+            {keep_state, State};
+        _ ->
+            %% The link is no longer there. The peer has discarded the link's
+            %% delivery state, so there's nothing for us to do.
+            ?LOG_DEBUG("amqp10_session: dropping disposition for unknown link handle ~b",
+                       [OutputHandle]),
+            keep_state_and_data
+    end;
 mapped(cast, #'v1_0.end'{} = End, State) ->
     %% We receive the first end frame, reply and terminate.
-    _ = send_end(State),
-    % TODO: send notifications for links?
+    %% `send_end/1` stops this process when the socket is gone, so notify first.
+    %% TODO: send notifications for links?
     ok = notify_session_ended(End, State),
+    _ = send_end(State),
     {stop, normal, State};
 mapped(cast, #'v1_0.attach'{name = {utf8, Name},
                             handle = {uint, InHandle},
@@ -754,20 +788,18 @@ is_bare_message_section(_Section) ->
 send_flow_link(OutHandle,
                #'v1_0.flow'{link_credit = {uint, Credit}} = Flow0, RenewWhenBelow,
                #state{links = Links} = State) ->
-    AutoFlow = case RenewWhenBelow of
-                   never -> never;
-                   _ -> {RenewWhenBelow, Credit}
-               end,
-    #{OutHandle := #link{state = LinkState,
-                         output_handle = H,
-                         role = receiver,
-                         delivery_count = DeliveryCount,
-                         available = Available} = Link} = Links,
-    case LinkState of
-        attach_refused ->
+    case Links of
+        #{OutHandle := #link{state = attach_refused}} ->
             %% We will receive the DETACH frame shortly.
             State;
-        _ ->
+        #{OutHandle := #link{output_handle = H,
+                             role = receiver,
+                             delivery_count = DeliveryCount,
+                             available = Available} = Link} ->
+            AutoFlow = case RenewWhenBelow of
+                           never -> never;
+                           _ -> {RenewWhenBelow, Credit}
+                       end,
             Flow1 = Flow0#'v1_0.flow'{
                             handle = uint(H),
                             %% "In the event that the receiving link endpoint has not yet seen the
@@ -778,7 +810,14 @@ send_flow_link(OutHandle,
             ok = send(Flow, State),
             State#state{links = Links#{OutHandle =>
                                        Link#link{link_credit = Credit,
-                                                 auto_flow = AutoFlow}}}
+                                                 auto_flow = AutoFlow}}};
+        _ ->
+            %% The link is no longer there, so there is nothing to grant
+            %% credit on. The owner has been or will be notified with a
+            %% detached event.
+            ?LOG_DEBUG("amqp10_session: dropping flow for unknown link handle ~b",
+                       [OutHandle]),
+            State
     end.
 
 send_flow_session(State) ->

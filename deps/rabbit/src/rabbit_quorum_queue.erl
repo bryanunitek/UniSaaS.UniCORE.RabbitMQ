@@ -468,25 +468,31 @@ single_active_consumer_on(Q) ->
 
 update_consumer_handler(QName, {ConsumerTag, ChPid}, Exclusive, AckRequired,
                         Prefetch, Active, ActivityStatus, Args) ->
-    catch rabbit_queue_type_util:local_or_remote_handler(ChPid, ?MODULE, update_consumer,
-                                                         [QName, ChPid, ConsumerTag,
-                                                          Exclusive, AckRequired,
-                                                          Prefetch, Active,
-                                                          ActivityStatus, Args]).
+    try
+        rabbit_queue_type_util:local_or_remote_handler(ChPid, ?MODULE, update_consumer,
+                                                       [QName, ChPid, ConsumerTag,
+                                                        Exclusive, AckRequired,
+                                                        Prefetch, Active,
+                                                        ActivityStatus, Args])
+    catch _:_ -> ok end.
 
 update_consumer(QName, ChPid, ConsumerTag, Exclusive, AckRequired, Prefetch,
                 Active, ActivityStatus, Args) ->
-    catch rabbit_core_metrics:consumer_updated(ChPid, ConsumerTag, Exclusive,
-                                               AckRequired,
-                                               QName, Prefetch, Active,
-                                               ActivityStatus, Args).
+    try
+        rabbit_core_metrics:consumer_updated(ChPid, ConsumerTag, Exclusive,
+                                             AckRequired,
+                                             QName, Prefetch, Active,
+                                             ActivityStatus, Args)
+    catch _:_ -> ok end.
 
 cancel_consumer_handler(QName, {ConsumerTag, ChPid}) ->
-    catch rabbit_queue_type_util:local_or_remote_handler(ChPid, ?MODULE, cancel_consumer,
-                                                         [QName, ChPid, ConsumerTag]).
+    try
+        rabbit_queue_type_util:local_or_remote_handler(ChPid, ?MODULE, cancel_consumer,
+                                                       [QName, ChPid, ConsumerTag])
+    catch _:_ -> ok end.
 
 cancel_consumer(QName, ChPid, ConsumerTag) ->
-    catch rabbit_core_metrics:consumer_deleted(ChPid, ConsumerTag, QName),
+    try rabbit_core_metrics:consumer_deleted(ChPid, ConsumerTag, QName) catch _:_ -> ok end,
     rabbit_queue_type_util:notify_consumer_deleted(ChPid, ConsumerTag, QName, ?INTERNAL_USER).
 
 become_leader(_QName, _Name) ->
@@ -653,7 +659,7 @@ spawn_notify_decorators(QName, startup = Fun, Args) ->
           end);
 spawn_notify_decorators(QName, Fun, Args) ->
     %% run in ra process for now
-    catch notify_decorators(QName, Fun, Args).
+    try notify_decorators(QName, Fun, Args) catch _:_ -> ok end.
 
 handle_tick(QName,
             #{config := #{name := Name} = Cfg,
@@ -1164,7 +1170,9 @@ delete(Q, _IfUnused, _IfEmpty, ActingUser) when ?amqqueue_is_quorum(Q) ->
 
 force_delete_queue(Servers) ->
     [begin
-         case catch(ra:force_delete_server(?RA_SYSTEM, S)) of
+         case try ra:force_delete_server(?RA_SYSTEM, S)
+              catch _:E -> {error, E}
+              end of
              ok -> ok;
              Err ->
                  ?LOG_WARNING(
@@ -2167,7 +2175,7 @@ i(open_files, Q) when ?is_amqqueue(Q) ->
                             [Name], ?RPC_TIMEOUT)];
 i(single_active_consumer_pid, Q) when ?is_amqqueue(Q) ->
     QPid = amqqueue:get_pid(Q),
-    case ra:local_query(QPid, fun rabbit_fifo:query_single_active_consumer/1) of
+    case rabbit_fifo_client:local_query(QPid, query_single_active_consumer) of
         {ok, {_, {value, {_ConsumerTag, ChPid}}}, _} ->
             ChPid;
         {ok, _, _} ->
@@ -2179,8 +2187,7 @@ i(single_active_consumer_pid, Q) when ?is_amqqueue(Q) ->
     end;
 i(single_active_consumer_tag, Q) when ?is_amqqueue(Q) ->
     QPid = amqqueue:get_pid(Q),
-    case ra:local_query(QPid,
-                        fun rabbit_fifo:query_single_active_consumer/1) of
+    case rabbit_fifo_client:local_query(QPid, query_single_active_consumer) of
         {ok, {_, {value, {ConsumerTag, _ChPid}}}, _} ->
             ConsumerTag;
         {ok, _, _} ->
@@ -2197,8 +2204,7 @@ i(message_bytes_ram, Q) when ?is_amqqueue(Q) ->
     0;
 i(messages_dlx, Q) when ?is_amqqueue(Q) ->
     QPid = amqqueue:get_pid(Q),
-    case ra:local_query(QPid,
-                        fun rabbit_fifo:query_stat_dlx/1) of
+    case rabbit_fifo_client:local_query(QPid, query_stat_dlx) of
         {ok, {_, {Num, _}}, _} ->
             Num;
         {error, _} ->
@@ -2208,8 +2214,7 @@ i(messages_dlx, Q) when ?is_amqqueue(Q) ->
     end;
 i(message_bytes_dlx, Q) when ?is_amqqueue(Q) ->
     QPid = amqqueue:get_pid(Q),
-    case ra:local_query(QPid,
-                        fun rabbit_fifo:query_stat_dlx/1) of
+    case rabbit_fifo_client:local_query(QPid, query_stat_dlx) of
         {ok, {_, {_, Bytes}}, _} ->
             Bytes;
         {error, _} ->
@@ -2462,7 +2467,7 @@ overflow(<<"reject-publish-dlx">> = V, Def, QName) ->
 notify_decorators(Q) when ?is_amqqueue(Q) ->
     QName = amqqueue:get_name(Q),
     QPid = amqqueue:get_pid(Q),
-    case ra:local_query(QPid, fun rabbit_fifo:query_notify_decorators_info/1) of
+    case rabbit_fifo_client:local_query(QPid, query_notify_decorators_info) of
         {ok, {_, {MaxActivePriority, IsEmpty}}, _} ->
             notify_decorators(QName, consumer_state_changed,
                               [MaxActivePriority, IsEmpty]);
@@ -2765,7 +2770,15 @@ check_process_limit_safety(QCount, ProcessLimitThreshold) ->
 
 maybe_log_leader_health_check_result([]) -> ok;
 maybe_log_leader_health_check_result(Result) ->
-    Qs = lists:map(fun(R) -> catch maps:get(<<"readable_name">>, R) end, Result),
+    Qs = lists:map(fun(R) ->
+                           try
+                               maps:get(<<"readable_name">>, R)
+                           catch
+                               throw:Thrown -> Thrown;
+                               exit:Reason -> {'EXIT', Reason};
+                               error:Reason:Stacktrace -> {'EXIT', {Reason, Stacktrace}}
+                           end
+                    end, Result),
     ?LOG_WARNING("Leader health check result (unhealthy leaders detected): ~tp", [Qs]).
 
 policy_apply_to_name() ->
