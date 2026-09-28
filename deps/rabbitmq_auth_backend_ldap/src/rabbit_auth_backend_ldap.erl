@@ -25,7 +25,9 @@
 -export([get_connections/0]).
 
 %% for tests
--export([purge_connections/0]).
+-export([purge_connections/0,
+         fill_user_dn_pattern/1, escaped_user_dn/1, simple_bind_fill_pattern/1,
+         fill_dn_with_username/2]).
 
 -define(L(F, A),  log("LDAP "         ++ F, A)).
 -define(L1(F, A), log("    LDAP "     ++ F, A)).
@@ -246,7 +248,7 @@ evaluate0({for, []}, _Args, _User, _LDAP) ->
 evaluate0({exists, DNPattern}, Args, _User, LDAP) ->
     %% eldap forces us to have a filter. objectClass should always be there.
     Filter = eldap:present("objectClass"),
-    DN = fill_dn(DNPattern, Args),
+    DN = fill_dn_with_username(DNPattern, Args),
     R = object_exists(DN, Filter, LDAP),
     ?L1("evaluated exists for \"~ts\": ~tp", [DN, R]),
     R;
@@ -258,7 +260,7 @@ evaluate0({in_group, DNPattern, Desc}, Args,
           #auth_user{impl = ImplFun}, LDAP) ->
     UserDN = (ImplFun())#impl.user_dn,
     Filter = eldap:equalityMatch(Desc, UserDN),
-    DN = fill_dn(DNPattern, Args),
+    DN = fill_dn_with_username(DNPattern, Args),
     R = object_exists(DN, Filter, LDAP),
     ?L1("evaluated in_group for \"~ts\": ~tp", [DN, R]),
     R;
@@ -277,7 +279,7 @@ evaluate0({in_group_nested, DNPattern, Desc, Scope}, Args,
                      B ->
                          B
                  end,
-    GroupDN = fill_dn(DNPattern, Args),
+    GroupDN = fill_dn_with_username(DNPattern, Args),
     EldapScope =
         case Scope of
             subtree      -> eldap:wholeSubtree();
@@ -368,7 +370,7 @@ evaluate0({string, StringPattern}, Args, _User, _LDAP) ->
     R;
 
 evaluate0({attribute, DNPattern, AttributeName}, Args, _User, LDAP) ->
-    DN = fill_dn(DNPattern, Args),
+    DN = fill_dn_with_username(DNPattern, Args),
     R = attribute(DN, AttributeName, LDAP),
     ?L1("evaluated attribute \"~ts\" for \"~ts\": ~tp",
         [AttributeName, DN, format_multi_attr(R)]),
@@ -427,39 +429,38 @@ safe_eval(_F, _,          {error, _}) -> false;
 safe_eval(F,  V1,         V2)         -> F(V1, V2).
 
 do_match(S1, S2) ->
-    case re:run(S1, S2) of
-        {match, _} ->
-            log_match(S1, S2, R = true),
-            R;
-        nomatch ->
-            log_match(S1, S2, R = false),
-            R
-    end.
+    R = rabbit_re:matches(S1, S2),
+    log_match(S1, S2, R),
+    R.
 
 %% In some cases when fetching regular expressions, LDAP evalution()
 %% returns a list of strings, so we need to wrap guards around that.
 %% If a list of strings is returned, loop and match versus each element.
 do_match_multi(S1, []) ->
-    log_match(S1, [], R = false),
+    R = false,
+    log_match(S1, [], R),
     R;
 do_match_multi(S1 = [H1|_], [H2|Tail]) when is_list(H2) and not is_list(H1) ->
-    case re:run(S1, H2) of
-        {match, _} ->
-            log_match(S1, H2, R = true),
+    case rabbit_re:matches(S1, H2) of
+        true ->
+            R = true,
+            log_match(S1, H2, R),
             R;
-        _ ->
+        false ->
             log_match(S1,H2, false),
             do_match_multi(S1, Tail)
     end;
 do_match_multi([], S2) ->
-    log_match([], S2, R = false),
+    R = false,
+    log_match([], S2, R),
     R;
 do_match_multi([H1|Tail], S2 = [H2|_] ) when is_list(H1) and not is_list(H2) ->
-    case re:run(H1, S2) of
-        {match, _} ->
-            log_match(H1, S2, R = true),
+    case rabbit_re:matches(H1, S2) of
+        true ->
+            R = true,
+            log_match(H1, S2, R),
             R;
-        _ ->
+        false ->
             log_match(H1, S2, false),
             do_match_multi(Tail, S2)
     end;
@@ -895,9 +896,7 @@ username_to_dn_prebind(Username) ->
               fun (LDAP) -> dn_lookup(Username, LDAP) end).
 
 username_to_dn(Username, LDAP,  postbind) -> dn_lookup(Username, LDAP);
-username_to_dn(Username, _LDAP, _When)    ->
-    ADArgs = rabbit_auth_backend_ldap_util:get_active_directory_args(Username),
-    fill_dn(env(user_dn_pattern), [{username, Username}] ++ ADArgs).
+username_to_dn(Username, _LDAP, _When)    -> escaped_user_dn(Username).
 
 dn_lookup(Username, LDAP) ->
     Filled = fill_user_dn_pattern(Username),
@@ -916,24 +915,67 @@ dn_lookup(Username, LDAP) ->
             ?LOG_WARNING("Searching for DN for ~ts, got back ~tp",
                          [Filled, Entries],
                          #{domain => ?RMQLOG_DOMAIN_LDAP}),
-            Filled;
+            %% Used as a bind DN, so RFC 4514-escape substituted values.
+            escaped_user_dn(Username);
         {error, _} = E ->
             exit(E)
     end.
 
 fill_user_dn_pattern(Username) ->
-    ADArgs = rabbit_auth_backend_ldap_util:get_active_directory_args(Username),
-    fill(env(user_dn_pattern), [{username, Username}] ++ ADArgs).
+    fill_raw(env(user_dn_pattern), Username).
+
+escaped_user_dn(Username) ->
+    fill_bind_dn(env(user_dn_pattern), Username).
 
 simple_bind_fill_pattern(Username) ->
     simple_bind_fill_pattern(env(user_bind_pattern), Username).
 
 simple_bind_fill_pattern(none, Username) ->
-    ADArgs = rabbit_auth_backend_ldap_util:get_active_directory_args(Username),
-    fill_dn(env(user_dn_pattern), [{username, Username}] ++ ADArgs);
+    escaped_user_dn(Username);
 simple_bind_fill_pattern(Pattern, Username) ->
+    fill_bind_dn(Pattern, Username).
+
+fill_bind_dn(Pattern, Username) ->
+    case is_dn_pattern(Pattern) of
+        true  -> fill_dn_pattern(Pattern, Username, []);
+        false -> fill_raw(Pattern, Username)
+    end.
+
+fill_raw(Pattern, Username) ->
     ADArgs = rabbit_auth_backend_ldap_util:get_active_directory_args(Username),
-    fill_dn(Pattern, [{username, Username}] ++ ADArgs).
+    fill(Pattern, [{username, Username}] ++ ADArgs).
+
+%% A DN always contains an `attr=value' pair. A pattern without one produces
+%% a bind name that is not a DN — a complete DN supplied as the username, a
+%% userPrincipalName, a down-level logon name — and RFC 4514 escaping would
+%% corrupt such names.
+is_dn_pattern(Pattern) ->
+    lists:member($=, rabbit_data_coercion:to_list(Pattern)).
+
+fill_dn_with_username(DNPattern, Args) ->
+    Username = pget(username, Args),
+    OtherArgs = [KV || {K, _} = KV <- Args,
+                       K =/= username, K =/= ad_domain, K =/= ad_user],
+    fill_dn_pattern(DNPattern, Username, OtherArgs).
+
+fill_dn_pattern(Pattern, Username, OtherArgs) ->
+    ADArgs = safe_ad_args(
+               rabbit_auth_backend_ldap_util:get_active_directory_args(Username)),
+    fill_dn(Pattern, [{username, Username}] ++ ADArgs ++ OtherArgs).
+
+%% Rejects an unusable "DOMAIN\user" split: a backslash in the user part
+%% makes the separator ambiguous, and an escaped user part starting with a
+%% backslash would pair with a preceding literal one, un-escaping the
+%% character after it (a DN injection). The AD variables then stay unfilled.
+safe_ad_args([{ad_domain, _}, {ad_user, User}] = ADArgs) ->
+    UserList = rabbit_data_coercion:to_list(User),
+    EscapedUser = rabbit_ldap_rfc4514:escape_value(UserList),
+    case lists:member($\\, UserList) orelse lists:prefix("\\", EscapedUser) of
+        false -> ADArgs;
+        true  -> []
+    end;
+safe_ad_args([]) ->
+    [].
 
 creds(User) -> creds(User, env(other_bind)).
 
@@ -971,7 +1013,7 @@ scrub_dn(DN, _) ->
 scrub_rdn([], Acc) ->
     string:join(lists:reverse(Acc), ",");
 scrub_rdn([DN|Rem], Acc) ->
-    DN0 = case catch string:tokens(DN, "=") of
+    DN0 = case try string:tokens(DN, "=") catch _:_ -> [] end of
               L = [RDN, _] -> case string:to_lower(RDN) of
                                   "cn"  -> [RDN, ?SCRUBBED_CREDENTIAL];
                                   "dc"  -> [RDN, ?SCRUBBED_CREDENTIAL];
@@ -986,7 +1028,9 @@ scrub_rdn([DN|Rem], Acc) ->
   scrub_rdn(Rem, [string:join(DN0, "=")|Acc]).
 
 is_dn(S) when is_list(S) ->
-    case catch string:tokens(rabbit_data_coercion:to_list(S), "=") of
+    case try string:tokens(rabbit_data_coercion:to_list(S), "=")
+         catch _:_ -> []
+         end of
         L when length(L) > 1 -> true;
         _                    -> false
     end;

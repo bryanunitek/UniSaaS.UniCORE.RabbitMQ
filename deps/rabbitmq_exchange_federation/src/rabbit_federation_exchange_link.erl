@@ -86,13 +86,26 @@ init_link({Upstream, XName}) ->
     case rabbit_exchange:lookup(XName) of
         {ok, X} ->
             DeobfuscatedUpstream = rabbit_federation_util:deobfuscate_upstream(Upstream),
-            DeobfuscatedUParams = rabbit_federation_upstream:to_params(DeobfuscatedUpstream, X),
-            UParams = rabbit_federation_util:obfuscate_upstream_params(DeobfuscatedUParams),
-            rabbit_federation_status:report(Upstream, UParams, XName, starting),
-            join(rabbit_federation_exchanges),
-            join({rabbit_federation_exchange, XName}),
-            gen_server2:cast(self(), maybe_go),
-            {ok, {not_started, {Upstream, UParams, XName}}};
+            case rabbit_federation_upstream:to_params(DeobfuscatedUpstream, X) of
+                {ok, DeobfuscatedUParams} ->
+                    UParams = rabbit_federation_util:obfuscate_upstream_params(DeobfuscatedUParams),
+                    rabbit_federation_status:report(Upstream, UParams, XName, starting),
+                    join(rabbit_federation_exchanges),
+                    join({rabbit_federation_exchange, XName}),
+                    gen_server2:cast(self(), maybe_go),
+                    {ok, {not_started, {Upstream, UParams, XName}}};
+                {error, {_Info, SafeURI} = Reason} ->
+                    %% Unable to parse upstream URI. Return `ignore` so this
+                    %% link's supervisor keeps its siblings and does not fail
+                    %% broker startup. Publish an entry to the status table
+                    %% so the link is visible via `federation_status`.
+                    rabbit_federation_util:log_skipped_link(
+                      XName, Upstream#upstream.name, Reason),
+                    rabbit_federation_status:report(
+                      Upstream, #upstream_params{safe_uri = SafeURI}, XName,
+                      {invalid_upstream_uri, Reason}),
+                    ignore
+            end;
         {error, not_found} ->
             ?LOG_WARNING("not found, stopping link", []),
             {stop, gone}
@@ -148,8 +161,8 @@ handle_cast(disconnect_for_shutdown, State = #state{
                 _ ->
                     try
                         {ok, Ch} = amqp_connection:open_channel(Conn),
-                        catch amqp_channel:call(Ch, #'queue.delete'{queue = Queue}),
-                        catch amqp_channel:call(Ch, #'exchange.delete'{exchange = IntExchange})
+                        try amqp_channel:call(Ch, #'queue.delete'{queue = Queue}) catch _:_ -> ok end,
+                        try amqp_channel:call(Ch, #'exchange.delete'{exchange = IntExchange}) catch _:_ -> ok end
                     catch
                         _:_ -> ok
                     end
@@ -240,6 +253,13 @@ handle_info(check_internal_exchange, State = #state{internal_exchange = IntXName
             TRef = erlang:send_after(Interval, self(), check_internal_exchange),
             {noreply, State#state{internal_exchange_timer = TRef}}
     end;
+
+handle_info({'EXIT', _From, Reason},
+            State = #state{upstream            = Upstream,
+                           upstream_params     = UParams,
+                           downstream_exchange = XName}) ->
+    rabbit_federation_link_util:handle_connection_exit(
+      Reason, Upstream, UParams, XName, State);
 
 handle_info({'EXIT', _From, Reason}, State) ->
     {stop, Reason, State};

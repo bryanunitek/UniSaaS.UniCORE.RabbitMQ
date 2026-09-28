@@ -23,6 +23,7 @@
 -type connection_step() :: tcp_connected | peer_properties_exchanged |
                            authenticating | authenticated | tuning |
                            tuned | opened | failure |
+                           silent_close |
                            closing | close_sent | closing_done.
 
 -record(publisher,
@@ -81,6 +82,7 @@
          virtual_host :: undefined | binary(),
          connection_step :: connection_step(),
          frame_max :: integer(),
+         max_uncompressed_sub_entry_batch_size :: integer(),
          heartbeat :: undefined | integer(),
          heartbeater :: any(),
          client_properties = #{} :: #{binary() => binary()},

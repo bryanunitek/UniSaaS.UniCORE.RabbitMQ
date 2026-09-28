@@ -245,7 +245,8 @@ teardown_steps_for_vms() ->
 
 run_make_dist(Config) ->
     LockId = {make_dist, self()},
-    global:set_lock(LockId, [node()]),
+    LockNodes = [node() | nodes()],
+    global:set_lock(LockId, LockNodes),
     case os:getenv("SKIP_MAKE_TEST_DIST") of
         false ->
             SrcDir = ?config(current_srcdir, Config),
@@ -260,14 +261,14 @@ run_make_dist(Config) ->
                     %% record the fact we went through it already so we
                     %% save redundant calls.
                     os:putenv("SKIP_MAKE_TEST_DIST", "true"),
-                    global:del_lock(LockId, [node()]),
+                    global:del_lock(LockId, LockNodes),
                     Config;
                 _ ->
-                    global:del_lock(LockId, [node()]),
+                    global:del_lock(LockId, LockNodes),
                     {skip, "Failed to run \"make test-dist\""}
             end;
         _ ->
-            global:del_lock(LockId, [node()]),
+            global:del_lock(LockId, LockNodes),
             ct:log(?LOW_IMPORTANCE, "(skip `$MAKE test-dist`)", []),
             Config
     end.
@@ -1319,6 +1320,7 @@ rabbitmqctl(Config, Node, Args, Timeout) ->
     Nodename = ?config(nodename, NodeConfig),
     Env0 = [
       {"RABBITMQ_SCRIPTS_DIR", filename:dirname(Rabbitmqctl)},
+      {"RABBITMQ_NODENAME", atom_to_list(Nodename)},
       {"RABBITMQ_PID_FILE", ?config(pid_file, NodeConfig)},
       {"RABBITMQ_MNESIA_DIR", ?config(data_dir, NodeConfig)},
       {"RABBITMQ_PLUGINS_DIR", ?config(plugins_dir, NodeConfig)},
@@ -1559,10 +1561,10 @@ add_vhost(Config, Node, VHost) ->
     add_vhost(Config, Node, VHost, <<"acting-user">>).
 
 add_vhost(Config, Node, VHost, Username) ->
-    catch rpc(Config, Node, rabbit_vhost, add, [VHost, Username]).
+    rpc_catch(Config, Node, rabbit_vhost, add, [VHost, Username]).
 
 update_vhost_metadata(Config, VHost, Meta) ->
-    catch rpc(Config, 0, rabbit_vhost, update_metadata, [VHost, Meta, <<"acting-user">>]).
+    rpc_catch(Config, 0, rabbit_vhost, update_metadata, [VHost, Meta, <<"acting-user">>]).
 
 enable_vhost_protection_from_deletion(Config, VHost) ->
     MetadataPatch = #{
@@ -1583,7 +1585,7 @@ delete_vhost(Config, Node, VHost) ->
     delete_vhost(Config, Node, VHost, <<"acting-user">>).
 
 delete_vhost(Config, Node, VHost, Username) ->
-    catch rpc(Config, Node, rabbit_vhost, delete, [VHost, Username]).
+    rpc_catch(Config, Node, rabbit_vhost, delete, [VHost, Username]).
 
 -define(FORCE_VHOST_FAILURE_REASON, force_vhost_failure).
 
@@ -1672,7 +1674,7 @@ add_user(Config, Node, Username, Password) ->
     add_user(Config, Node, Username, Password, <<"acting-user">>).
 
 add_user(Config, Node, Username, Password, AuditUsername) ->
-    catch rpc(Config, Node, rabbit_auth_backend_internal, add_user,
+    rpc_catch(Config, Node, rabbit_auth_backend_internal, add_user,
               [rabbit_data_coercion:to_binary(Username),
                rabbit_data_coercion:to_binary(Password),
                AuditUsername]).
@@ -1681,7 +1683,7 @@ set_user_tags(Config, Node, Username, Tags) ->
     set_user_tags(Config, Node, Username, Tags, <<"acting-user">>).
 
 set_user_tags(Config, Node, Username, Tags, AuditUsername) ->
-    catch rpc(Config, Node, rabbit_auth_backend_internal, set_tags,
+    rpc_catch(Config, Node, rabbit_auth_backend_internal, set_tags,
               [Username, Tags, AuditUsername]).
 
 delete_user(Config, Username) ->
@@ -1691,7 +1693,7 @@ delete_user(Config, Node, Username) ->
     delete_user(Config, Node, Username, <<"acting-user">>).
 
 delete_user(Config, Node, Username, AuditUsername) ->
-    catch rpc(Config, Node, rabbit_auth_backend_internal, delete_user,
+    rpc_catch(Config, Node, rabbit_auth_backend_internal, delete_user,
               [Username, AuditUsername]).
 
 change_password(Config, Username, Password) ->
@@ -1906,6 +1908,17 @@ rpc(Config, Nodes, Module, Function, Args, Timeout)
 when is_list(Nodes) ->
     [rpc(Config, Node, Module, Function, Args, Timeout) || Node <- Nodes].
 
+%% Like rpc/5, but catches any exception raised by the RPC and returns it in
+%% the same shape as the classic `catch Expr' would have.
+rpc_catch(Config, Node, Module, Function, Args) ->
+    try
+        rpc(Config, Node, Module, Function, Args)
+    catch
+        throw:Thrown -> Thrown;
+        exit:Reason -> {'EXIT', Reason};
+        error:Reason:Stacktrace -> {'EXIT', {Reason, Stacktrace}}
+    end.
+
 rpc_all(Config, Module, Function, Args) ->
     Nodes = get_node_configs(Config, nodename),
     rpc(Config, Nodes, Module, Function, Args).
@@ -1931,7 +1944,9 @@ start_node(Config, Node) ->
 async_start_node(Config, Node) ->
     Self = self(),
     spawn(fun() ->
-                  Reply = (catch start_node(Config, Node)),
+                  Reply = try start_node(Config, Node)
+                          catch _:E -> {error, E}
+                          end,
                   Self ! {async_start_node, Node, Reply}
           end),
     ok.

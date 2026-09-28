@@ -40,6 +40,11 @@ all() ->
         test_restricted_vhost_access_with_a_valid_token,
         test_insufficient_permissions_in_a_valid_token,
         test_token_expiration,
+        test_token_expiry_with_float_exp,
+        test_token_expiry_with_non_numeric_exp,
+        test_token_expiry_with_missing_exp,
+        test_missing_required_exp_claim,
+        test_missing_not_required_exp_claim,
         test_invalid_signature,
         test_incorrect_kid,
         normalize_token_scope_using_multiple_scopes_key,
@@ -73,8 +78,9 @@ groups() ->
           test_successful_access_with_a_token_that_uses_single_scope_alias_in_extra_scope_source_field,
           test_successful_access_with_a_token_that_uses_multiple_scope_aliases_in_extra_scope_source_field,
           normalize_token_scope_with_additional_scopes_complex_claims,
-          test_successful_access_with_a_token_that_uses_single_scope_alias_in_scope_field_and_custom_scope_prefix
-
+          test_successful_access_with_a_token_that_uses_single_scope_alias_in_scope_field_and_custom_scope_prefix,
+          test_missing_required_exp_claim_per_resource_server,
+          test_missing_not_required_exp_claim_per_resource_server
       ]}
     ].
 
@@ -1176,6 +1182,31 @@ test_insufficient_permissions_in_a_valid_token(_) ->
     assert_topic_access_refused(User, VHost, <<"bar">>, read,
         #{routing_key => <<"foo/#">>}).
 
+%% A fractional "exp" (RFC 7519) must still be honoured: an expired float
+%% "exp" is rejected at login, a future one yields a numeric expiry_timestamp.
+test_token_expiration_with_float_exp(_) ->
+    Username = <<"username">>,
+    Jwk = ?UTIL_MOD:fixture_jwk(),
+    UaaEnv = [{signing_keys, #{<<"token-key">> => {map, Jwk}}}],
+    set_env(key_config, UaaEnv),
+    set_env(resource_server_id, <<"rabbitmq">>),
+
+    Now = os:system_time(seconds),
+
+    ExpiredToken = (?UTIL_MOD:token_with_sub(?UTIL_MOD:fixture_token(), Username))#{
+        <<"exp">> => (Now - 10) + 0.5},
+    ExpiredSigned = ?UTIL_MOD:sign_token_hs(ExpiredToken, Jwk),
+    ?assertMatch({refused, _, _},
+                 user_login_authentication(Username, [{password, ExpiredSigned}])),
+
+    FutureExp = Now + 60,
+    ValidToken = (?UTIL_MOD:token_with_sub(?UTIL_MOD:fixture_token(), Username))#{
+        <<"exp">> => FutureExp + 0.5},
+    ValidSigned = ?UTIL_MOD:sign_token_hs(ValidToken, Jwk),
+    {ok, #auth_user{username = Username} = User} =
+        user_login_authentication(Username, [{password, ValidSigned}]),
+    ?assertEqual(FutureExp, rabbit_auth_backend_oauth2:expiry_timestamp(User)).
+
 test_invalid_signature(_) ->
     Username = <<"username">>,
     Jwk = ?UTIL_MOD:fixture_jwk(),
@@ -1215,6 +1246,151 @@ test_token_expiration(_) ->
 
     ?assertMatch({refused, _, _},
                  user_login_authentication(Username, [{password, Token}])).
+
+test_token_expiry_with_float_exp(_) ->
+    Username = <<"username">>,
+    set_env(resource_server_id, <<"rabbitmq">>),
+
+    %% A valid, future float exp must be accepted and expiry_timestamp must
+    %% return the truncated integer — not the atom 'never'.
+    FutureFloatExp = float(os:system_time(seconds) + 600),
+    FutureToken = (?UTIL_MOD:token_with_sub(?UTIL_MOD:expirable_token(), Username))
+                    #{<<"exp">> := FutureFloatExp},
+    {ok, #auth_user{username = Username} = User} =
+        user_login_authentication(Username, [{password, FutureToken}]),
+    ?assertEqual(trunc(FutureFloatExp), rabbit_auth_backend_oauth2:expiry_timestamp(User)),
+
+    %% An already-expired float exp must be refused, not silently accepted.
+    PastFloatExp = float(os:system_time(seconds) - 10),
+    ExpiredToken = (?UTIL_MOD:token_with_sub(?UTIL_MOD:expirable_token(), Username))
+                    #{<<"exp">> := PastFloatExp},
+    ?assertMatch({refused, _, _},
+                 user_login_authentication(Username, [{password, ExpiredToken}])).
+
+test_token_expiry_with_non_numeric_exp(_) ->
+    Username = <<"username">>,
+    set_env(resource_server_id, <<"rabbitmq">>),
+
+    %% A token whose exp claim is not a number (e.g. a string) must be refused,
+    %% not silently accepted because the is_number guard falls through to the
+    %% no-exp-field catch-all clause.
+    lists:foreach(fun(NonNumericExp) ->
+        InvalidToken = (?UTIL_MOD:token_with_sub(?UTIL_MOD:expirable_token(), Username))
+                        #{<<"exp">> := NonNumericExp},
+        ?assertMatch({refused, _, _},
+                     user_login_authentication(Username, [{password, InvalidToken}]))
+    end, [<<"1700000300">>, true, false, null]).
+
+test_token_expiry_with_missing_exp(_) ->
+    Username = <<"username">>,
+    set_env(resource_server_id, <<"rabbitmq">>),
+
+    TokenWithoutExp = maps:remove(<<"exp">>,
+        ?UTIL_MOD:token_with_sub(?UTIL_MOD:expirable_token(), Username)),
+
+    %% Default (require_exp = true): a token without exp must be refused.
+    set_env(require_exp, true),
+    ?assertMatch({refused, _, _},
+                 user_login_authentication(Username, [{password, TokenWithoutExp}])),
+
+    %% When require_exp = false, a token without exp is accepted.
+    set_env(require_exp, false),
+    ?assertMatch({ok, _},
+                 user_login_authentication(Username, [{password, TokenWithoutExp}])),
+    unset_env(require_exp).
+
+test_missing_required_exp_claim(_) ->
+    Username = <<"username">>,
+    Jwk = ?UTIL_MOD:fixture_jwk(),
+    UaaEnv = [{signing_keys, #{<<"token-key">> => {map, Jwk}}}],
+    set_env(key_config, UaaEnv),
+    set_env(resource_server_id, <<"rabbitmq">>),
+
+    %% A signed token with no exp claim must be refused when require_exp = true (the default).
+    TokenData = maps:remove(<<"exp">>,
+        ?UTIL_MOD:token_with_sub(?UTIL_MOD:expirable_token(), Username)),
+    Token = ?UTIL_MOD:sign_token_hs(TokenData, Jwk),
+    ?assertMatch({refused, _, _},
+                 user_login_authentication(Username, [{password, Token}])).
+
+test_missing_not_required_exp_claim(_) ->
+    VHost    = <<"vhost">>,
+    Username = <<"username">>,
+    Jwk = ?UTIL_MOD:fixture_jwk(),
+    UaaEnv = [{signing_keys, #{<<"token-key">> => {map, Jwk}}}],
+    set_env(key_config, UaaEnv),
+    set_env(resource_server_id, <<"rabbitmq">>),
+
+    %% When require_exp = false, a token without exp must authenticate successfully.
+    set_env(require_exp, false),
+    TokenData = maps:remove(<<"exp">>,
+        ?UTIL_MOD:token_with_sub(?UTIL_MOD:expirable_token(), Username)),
+    Token = ?UTIL_MOD:sign_token_hs(TokenData, Jwk),
+    {ok, #auth_user{username = Username} = User} =
+        user_login_authentication(Username, [{password, Token}]),
+
+    %% expiry_timestamp must return 'never' since there is no exp claim.
+    ?assertEqual(never, rabbit_auth_backend_oauth2:expiry_timestamp(User)),
+
+    %% Resource access checks must also pass: the stored token carries
+    %% x-rmq-require-exp = false so validate_token_expiry/1 returns ok.
+    assert_resource_access_granted(User, VHost, <<"foo">>, configure),
+    assert_resource_access_granted(User, VHost, <<"foo">>, write),
+
+    unset_env(require_exp).
+
+%% Same scenarios as test_missing_required_exp_claim and
+%% test_missing_not_required_exp_claim, but require_exp is configured via the
+%% resource_servers map (indexed by resource server name) rather than through
+%% the top-level require_exp application environment variable.
+test_missing_required_exp_claim_per_resource_server(_) ->
+    Username = <<"username">>,
+    Jwk = ?UTIL_MOD:fixture_jwk(),
+    UaaEnv = [{signing_keys, #{<<"token-key">> => {map, Jwk}}}],
+    set_env(key_config, UaaEnv),
+
+    %% Route audience resolution through resource_servers, not the root server.
+    unset_env(resource_server_id),
+    set_env(resource_servers, #{<<"rabbitmq">> => [{id, <<"rabbitmq">>}]}),
+
+    %% require_exp defaults to true, so a token without exp must be refused.
+    TokenData = maps:remove(<<"exp">>,
+        ?UTIL_MOD:token_with_sub(?UTIL_MOD:expirable_token(), Username)),
+    Token = ?UTIL_MOD:sign_token_hs(TokenData, Jwk),
+    ?assertMatch({refused, _, _},
+                 user_login_authentication(Username, [{password, Token}])),
+
+    set_env(resource_server_id, <<"rabbitmq">>),
+    unset_env(resource_servers).
+
+test_missing_not_required_exp_claim_per_resource_server(_) ->
+    VHost    = <<"vhost">>,
+    Username = <<"username">>,
+    Jwk = ?UTIL_MOD:fixture_jwk(),
+    UaaEnv = [{signing_keys, #{<<"token-key">> => {map, Jwk}}}],
+    set_env(key_config, UaaEnv),
+
+    %% Route audience resolution through resource_servers, not the root server.
+    %% Set require_exp = false on the named resource server entry.
+    unset_env(resource_server_id),
+    set_env(resource_servers, #{<<"rabbitmq">> => [
+        {id, <<"rabbitmq">>},
+        {require_exp, false}
+    ]}),
+
+    TokenData = maps:remove(<<"exp">>,
+        ?UTIL_MOD:token_with_sub(?UTIL_MOD:expirable_token(), Username)),
+    Token = ?UTIL_MOD:sign_token_hs(TokenData, Jwk),
+    {ok, #auth_user{username = Username} = User} =
+        user_login_authentication(Username, [{password, Token}]),
+
+    ?assertEqual(never, rabbit_auth_backend_oauth2:expiry_timestamp(User)),
+
+    assert_resource_access_granted(User, VHost, <<"foo">>, configure),
+    assert_resource_access_granted(User, VHost, <<"foo">>, write),
+
+    set_env(resource_server_id, <<"rabbitmq">>),
+    unset_env(resource_servers).
 
 test_incorrect_kid(_) ->
     AltKid   = <<"other-token-key">>,

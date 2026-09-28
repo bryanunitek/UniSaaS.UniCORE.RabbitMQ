@@ -48,11 +48,11 @@
 
 -behaviour(gen_server2).
 
--export([start_link/10, start_link/11, do/2, do/3, do_flow/3, flush/1, shutdown/1]).
+-export([start_link/10, start_link/11, flush/1, shutdown/1]).
 -export([send_command/2]).
 -export([list/0, info_keys/0, info/1, info/2, info_all/0, info_all/1,
          emit_info_all/4, info_local/1]).
--export([refresh_config_local/0, ready_for_close/1]).
+-export([refresh_config_local/0]).
 -export([refresh_interceptors/0]).
 -export([force_event_refresh/1]).
 -export([update_user_state/2]).
@@ -108,6 +108,7 @@
           consumer_timeout,
           authz_context,
           max_consumers,  % taken from rabbit.consumer_max_per_channel
+          max_tx_messages,  % taken from rabbit.channel_tx_message_max
           %% defines how ofter gc will be executed
           writer_gc_threshold,
           msg_interceptor_ctx :: rabbit_msg_interceptor:context()
@@ -173,6 +174,11 @@
 -define(QUEUE, lqueue).
 
 -define(MAX_PERMISSION_CACHE_SIZE, 12).
+
+%% A transaction's publishes are buffered in the channel process until
+%% tx.commit, with none of the credit-flow backpressure that applies
+%% outside a transaction; this bounds that buffer.
+-define(MAX_CHANNEL_TX_MESSAGES, 10_000).
 
 -define(REFRESH_TIMEOUT, 15000).
 
@@ -261,27 +267,6 @@ start_link(Channel, ReaderPid, WriterPid, ConnPid, ConnName, User,
     gen_server2:start_link(
       ?MODULE, [Channel, ReaderPid, WriterPid, ConnPid, ConnName,
                 User, VHost, Capabilities, CollectorPid, Limiter, AmqpParams], []).
-
--spec do(pid(), rabbit_framing:amqp_method_record()) -> 'ok'.
-
-do(Pid, Method) ->
-    rabbit_channel_common:do(Pid, Method).
-
--spec do
-        (pid(), rabbit_framing:amqp_method_record(),
-         rabbit_types:'maybe'(rabbit_types:content())) ->
-            'ok'.
-
-do(Pid, Method, Content) ->
-    rabbit_channel_common:do(Pid, Method, Content).
-
--spec do_flow
-        (pid(), rabbit_framing:amqp_method_record(),
-         rabbit_types:'maybe'(rabbit_types:content())) ->
-            'ok'.
-
-do_flow(Pid, Method, Content) ->
-    rabbit_channel_common:do_flow(Pid, Method, Content).
 
 -spec flush(pid()) -> 'ok'.
 
@@ -397,11 +382,6 @@ refresh_interceptors() ->
       list_local()),
     ok.
 
--spec ready_for_close(pid()) -> 'ok'.
-
-ready_for_close(Pid) ->
-    rabbit_channel_common:ready_for_close(Pid).
-
 -spec force_event_refresh(reference()) -> 'ok'.
 
 % Note: https://www.pivotaltracker.com/story/show/166962656
@@ -455,6 +435,8 @@ init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, User, VHost,
     OptionalVariables = extract_variable_map_from_amqp_params(AmqpParams),
     {ok, GCThreshold} = application:get_env(rabbit, writer_gc_threshold),
     MaxConsumers = application:get_env(rabbit, consumer_max_per_channel, infinity),
+    MaxTxMessages = application:get_env(rabbit, channel_tx_message_max,
+                                         ?MAX_CHANNEL_TX_MESSAGES),
     MsgIcptCtx = #{protocol => amqp091,
                    vhost => VHost,
                    username => User#user.username,
@@ -475,6 +457,7 @@ init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, User, VHost,
                             consumer_timeout = ConsumerTimeout,
                             authz_context = OptionalVariables,
                             max_consumers = MaxConsumers,
+                            max_tx_messages = MaxTxMessages,
                             writer_gc_threshold = GCThreshold,
                             msg_interceptor_ctx = MsgIcptCtx},
                 limiter = Limiter,
@@ -601,7 +584,12 @@ handle_cast({method, Method, Content, Flow},
 handle_cast(ready_for_close,
             State = #ch{cfg = #conf{state = closing,
                                     writer_pid = WriterPid}}) ->
-    ok = rabbit_writer:send_command_sync(WriterPid, #'channel.close_ok'{}),
+    try
+        ok = rabbit_writer:send_command_sync(WriterPid, #'channel.close_ok'{})
+    catch
+        _Class:Reason ->
+            ?LOG_DEBUG("Failed to send 'channel.close_ok' on a terminating connection, reason: ~tp", [Reason])
+    end,
     {stop, normal, State};
 
 handle_cast(terminate, State = #ch{cfg = #conf{writer_pid = WriterPid}}) ->
@@ -734,26 +722,32 @@ terminate(_Reason,
           State = #ch{cfg = #conf{user = #user{username = Username}},
                       consumer_mapping = CM,
                       queue_states = QueueCtxs}) ->
-    rabbit_queue_type:close(QueueCtxs),
-    {_Res, _State1} = notify_queues(State),
-    pg_local:leave(rabbit_channels, self()),
-    rabbit_event:if_enabled(State, #ch.stats_timer,
-                            fun() -> emit_stats(State) end),
-    [delete_stats(Tag) || {Tag, _} <- get()],
-    maybe_decrease_global_publishers(State),
-    maps:foreach(
-      fun (_, _) ->
-              rabbit_global_counters:consumer_deleted(amqp091)
-      end, CM),
-    rabbit_core_metrics:channel_closed(self()),
-    rabbit_event:notify(channel_closed, [{pid, self()},
-                                         {user_who_performed_action, Username},
-                                         {consumer_count, maps:size(CM)}]),
-    case rabbit_confirms:size(State#ch.unconfirmed) of
-        0 -> ok;
-        NumConfirms ->
-            ?LOG_WARNING("Channel is stopping with ~b pending publisher confirms",
-                               [NumConfirms])
+    try
+        rabbit_queue_type:close(QueueCtxs),
+        {_Res, _State1} = notify_queues(State),
+        pg_local:leave(rabbit_channels, self()),
+        rabbit_event:if_enabled(State, #ch.stats_timer,
+                                fun() -> emit_stats(State) end),
+        [delete_stats(Tag) || {Tag, _} <- get()],
+        maybe_decrease_global_publishers(State),
+        maps:foreach(
+          fun (_, _) ->
+                  rabbit_global_counters:consumer_deleted(amqp091)
+          end, CM),
+        rabbit_core_metrics:channel_closed(self()),
+        rabbit_event:notify(channel_closed, [{pid, self()},
+                                             {user_who_performed_action, Username},
+                                             {consumer_count, maps:size(CM)}]),
+        case rabbit_confirms:size(State#ch.unconfirmed) of
+            0 -> ok;
+            NumConfirms ->
+                ?LOG_WARNING("Channel is stopping with ~b pending publisher confirms",
+                                   [NumConfirms])
+        end
+    catch
+        _Class:Reason ->
+            ?LOG_WARNING("Channel ~tp termination cleanup failed with reason: ~tp",
+                         [self(), Reason])
     end.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -983,6 +977,18 @@ extract_variable_map_from_amqp_params([Value]) ->
 extract_variable_map_from_amqp_params(_) ->
     #{}.
 
+check_tx_size({Msgs, _Acks}, MaxTxMessages) ->
+    case ?QUEUE:len(Msgs) >= MaxTxMessages of
+        true ->
+            rabbit_misc:precondition_failed(
+              "transaction has reached the maximum of ~B uncommitted publishes",
+              [MaxTxMessages]);
+        false ->
+            ok
+    end;
+check_tx_size(_Tx, _MaxTxMessages) ->
+    ok.
+
 check_msg_size(Content, GCThreshold) ->
     MaxMessageSize = persistent_term:get(max_message_size),
     Size = rabbit_basic:maybe_gc_large_msg(Content, GCThreshold),
@@ -1183,12 +1189,14 @@ handle_method(#'basic.publish'{exchange    = ExchangeNameBin,
                                                 trace_state = TraceState,
                                                 authz_context = AuthzContext,
                                                 writer_gc_threshold = GCThreshold,
+                                                max_tx_messages = MaxTxMessages,
                                                 msg_interceptor_ctx = MsgIcptCtx
                                                },
                                    tx               = Tx,
                                    confirm_enabled  = ConfirmEnabled,
                                    delivery_flow    = Flow
                                    }) ->
+    check_tx_size(Tx, MaxTxMessages),
     State1 = maybe_increase_global_publishers(State0),
     rabbit_global_counters:messages_received(amqp091, 1),
     check_msg_size(Content, GCThreshold),

@@ -101,7 +101,20 @@
 {mapping,
  "auth_oauth2.verify_aud",
  "rabbitmq_auth_backend_oauth2.verify_aud",
- [{datatype, {enum, [true, false]}}]}.
+ [{datatype, boolean}]}.
+
+%% Require the exp (expiration time) claim in JWT tokens. When true (the
+%% default), a token without an exp claim is rejected. RFC 7519 makes exp
+%% optional, but a token without it never expires, so a stolen or leaked token
+%% stays valid forever. Set to false only when your identity provider cannot
+%% issue tokens with an exp claim.
+%%
+%% {require_exp, true},
+
+{mapping,
+ "auth_oauth2.require_exp",
+ "rabbitmq_auth_backend_oauth2.require_exp",
+ [{datatype, boolean}]}.
 
 %% Configure the preferred username's JWT claim(s). These are the JWT claims or attributes
 %% used to determine the user's identity, a.k.a username.
@@ -254,10 +267,16 @@
 {mapping,
  "auth_oauth2.https.fail_if_no_peer_cert",
  "rabbitmq_auth_backend_oauth2.key_config.fail_if_no_peer_cert",
- [{datatype, {enum, [true, false]}}]}.
+ [{datatype, boolean}]}.
 
 {validator, "https_uri", "According to the JWT Specification, Key Server URL must be https.",
  fun(Uri) -> string:nth_lexeme(Uri, 1, "://") == "https" end}.
+
+%% No-op stub: pre-3.8.0 cuttlefish silently ignored unknown validator names,
+%% so call sites referencing "uri" performed no check. 3.8.0 rejects undefined
+%% names; this preserves the original accept-all behaviour.
+{validator, "uri", "URI string (no additional validation)",
+ fun(_Uri) -> true end}.
 
 {mapping,
  "auth_oauth2.algorithms.$algorithm",
@@ -396,6 +415,16 @@
  "auth_oauth2.resource_servers.$name.scope_aliases.$index.scope",
  "rabbitmq_auth_backend_oauth2.resource_servers",
  [{datatype, string}]}.
+
+{mapping,
+ "auth_oauth2.resource_servers.$name.verify_aud",
+ "rabbitmq_auth_backend_oauth2.verify_aud",
+ [{datatype, boolean}]}.
+
+{mapping,
+ "auth_oauth2.resource_servers.$name.require_exp",
+ "rabbitmq_auth_backend_oauth2.require_exp",
+ [{datatype, boolean}]}.
 
 {mapping,
   "auth_oauth2.resource_servers.$name.oauth_provider_id",

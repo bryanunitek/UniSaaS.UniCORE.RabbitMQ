@@ -32,6 +32,7 @@
          queue_length/1,
          get_replicas/1,
          transfer_leadership/2,
+         transfer_leadership/3,
          init/1,
          close/1,
          state_info/1,
@@ -77,7 +78,7 @@
 -define(INFO_KEYS, [name, durable, auto_delete, arguments, leader, members, online, state,
                     messages, messages_ready, messages_unacknowledged, committed_offset,
                     policy, operator_policy, effective_policy_definition, type, memory,
-                    consumers, segments, committed_chunk_id]).
+                    consumers, segments, committed_chunk_id, first_timestamp]).
 
 -define(UNMATCHED_THRESHOLD, 200).
 
@@ -842,6 +843,14 @@ i(segments = F, Q) ->
         _ ->
             ''
     end;
+i(first_timestamp = F, Q) ->
+    Key = {osiris_writer, amqqueue:get_name(Q)},
+    case osiris_counters:counters(Key, [F]) of
+        #{F := V} ->
+            V;
+        _ ->
+            ''
+    end;
 i(policy, Q) ->
     case rabbit_policy:name(Q) of
         none   -> '';
@@ -885,6 +894,23 @@ transfer_leadership(Q, Destination) ->
             {error, timeout};
         {error, _} = Err ->
             Err
+    end.
+
+-spec transfer_leadership(rabbit_types:vhost(), rabbit_misc:resource_name(), node()) ->
+    {ok, node()} | {error, term()}.
+transfer_leadership(VHost, Name, Destination) ->
+    QName = queue_resource(VHost, Name),
+    case rabbit_amqqueue:lookup(QName) of
+        {ok, Q} when ?amqqueue_is_classic(Q) ->
+            {error, classic_queue_not_supported};
+        {ok, Q} when ?amqqueue_is_quorum(Q) ->
+            {error, quorum_queue_not_supported};
+        {ok, Q} when ?amqqueue_is_stream(Q) ->
+            transfer_leadership(Q, Destination);
+        {ok, Q} ->
+            {error, {not_supported_for_type, amqqueue:get_type(Q)}};
+        E ->
+            E
     end.
 
 -spec status(rabbit_types:vhost(), Name :: rabbit_misc:resource_name()) ->
@@ -1207,7 +1233,7 @@ matches_strategy(even, Members) ->
     length(Members) rem 2 == 0.
 
 is_match(Subj, E) ->
-    nomatch /= re:run(Subj, E).
+    rabbit_re:matches(Subj, E).
 
 get_resource_name(#resource{name = Name}) ->
     Name.

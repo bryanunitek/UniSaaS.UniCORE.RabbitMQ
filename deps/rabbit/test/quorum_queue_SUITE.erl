@@ -86,6 +86,8 @@ groups() ->
                                             delete_declare,
                                             delete_member_during_node_down,
                                             delete_while_publishing,
+                                            delete_ra_cluster_already_shutting_down,
+                                            concurrent_vhost_delete_with_quorum_queue,
                                             metrics_cleanup_on_leadership_takeover,
                                             metrics_cleanup_on_leader_crash,
                                             consume_in_minority,
@@ -122,7 +124,8 @@ groups() ->
                                             replica_states,
                                             restart_after_queue_reincarnation,
                                             no_messages_after_queue_reincarnation,
-                                            consumer_message_is_delevered_after_snapshot
+                                            consumer_message_is_delevered_after_snapshot,
+                                            mixed_version_local_queries
                                            ]
                        ++ all_tests()},
                       {cluster_size_5, [], [start_queue,
@@ -155,9 +158,13 @@ all_tests() ->
      declare_invalid_arg_1,
      declare_invalid_arg_2,
      declare_invalid_arg_3,
+     declare_invalid_consumer_timeout,
+     declare_invalid_consumer_disconnected_timeout,
      relaxed_argument_equivalence_checks_on_qq_redeclare,
      consume_invalid_arg_1,
      consume_invalid_arg_2,
+     consume_invalid_consumer_timeout_negative,
+     consume_invalid_consumer_timeout_wrong_type,
      start_queue,
      long_name,
      stop_queue,
@@ -538,6 +545,26 @@ declare_invalid_arg_3(Config) ->
        declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"quorum">>},
                        {<<"x-max-length">>, long, -5}])).
 
+declare_invalid_consumer_timeout(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Q = ?config(queue_name, Config),
+
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 406, _}}, _},
+       declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                       {<<"x-consumer-timeout">>, long, -1}])).
+
+declare_invalid_consumer_disconnected_timeout(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Q = ?config(queue_name, Config),
+
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 406, _}}, _},
+       declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                       {<<"x-consumer-disconnected-timeout">>, long, -1}])).
+
 
 relaxed_argument_equivalence_checks_on_qq_redeclare(Config) ->
     ok = rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env,
@@ -611,6 +638,40 @@ consume_invalid_arg_2(Config) ->
        amqp_channel:subscribe(Ch, #'basic.consume'{
                                      queue = Q,
                                      arguments = [{<<"x-priority">>, longstr, <<"important">>}],
+                                     no_ack = false,
+                                     consumer_tag = <<"ctag">>},
+                              self())).
+
+consume_invalid_consumer_timeout_negative(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Q = ?config(queue_name, Config),
+
+    ?assertEqual({'queue.declare_ok', Q, 0, 0},
+                 declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"quorum">>}])),
+
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 406, _}}, _},
+       amqp_channel:subscribe(Ch, #'basic.consume'{
+                                     queue = Q,
+                                     arguments = [{<<"x-consumer-timeout">>, long, -1}],
+                                     no_ack = false,
+                                     consumer_tag = <<"ctag">>},
+                              self())).
+
+consume_invalid_consumer_timeout_wrong_type(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Q = ?config(queue_name, Config),
+
+    ?assertEqual({'queue.declare_ok', Q, 0, 0},
+                 declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"quorum">>}])),
+
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 406, _}}, _},
+       amqp_channel:subscribe(Ch, #'basic.consume'{
+                                     queue = Q,
+                                     arguments = [{<<"x-consumer-timeout">>, longstr, <<"never">>}],
                                      no_ack = false,
                                      consumer_tag = <<"ctag">>},
                               self())).
@@ -1297,36 +1358,36 @@ single_active_consumer_priority(Config) ->
     %% assert each queue has a different consumer
 
     %% Q1 should have the consumer on Ch1
-    ?assertMatch(#{single_active_consumer_id := {<<"ch1-ctag1">>, _}},
-                 machine_overview({RaNameQ1, Server0})),
+    %% Single active consumer election flows through Ra and is applied
+    %% asynchronously, so poll rather than asserting once.
+    ?awaitMatch(#{single_active_consumer_id := {<<"ch1-ctag1">>, _}},
+                machine_overview({RaNameQ1, Server0}), ?DEFAULT_AWAIT),
 
     %% Q2 Ch2
-    ?assertMatch(#{single_active_consumer_id := {<<"ch2-ctag2">>, _}},
-                 machine_overview({RaNameQ2, Server0})),
+    ?awaitMatch(#{single_active_consumer_id := {<<"ch2-ctag2">>, _}},
+                machine_overview({RaNameQ2, Server0}), ?DEFAULT_AWAIT),
 
     %% Q3 Ch3
-    ?assertMatch(#{single_active_consumer_id := {<<"ch3-ctag3">>, _}},
-                 machine_overview({RaNameQ3, Server0})),
+    ?awaitMatch(#{single_active_consumer_id := {<<"ch3-ctag3">>, _}},
+                machine_overview({RaNameQ3, Server0}), ?DEFAULT_AWAIT),
 
     %% close Ch3
     _ = rabbit_ct_client_helpers:close_channel(Ch3),
-    flush(100),
 
     %% assert Q3 has Ch2 (priority 2) as consumer
-    ?assertMatch(#{single_active_consumer_id := {<<"ch2-ctag3">>, _}},
-                 machine_overview({RaNameQ3, Server0})),
+    ?awaitMatch(#{single_active_consumer_id := {<<"ch2-ctag3">>, _}},
+                machine_overview({RaNameQ3, Server0}), ?DEFAULT_AWAIT),
 
     %% close Ch2
     _ = rabbit_ct_client_helpers:close_channel(Ch2),
-    flush(100),
 
     %% assert all queues as has Ch1 as consumer
-    ?assertMatch(#{single_active_consumer_id := {<<"ch1-ctag1">>, _}},
-                 machine_overview({RaNameQ1, Server0})),
-    ?assertMatch(#{single_active_consumer_id := {<<"ch1-ctag2">>, _}},
-                 machine_overview({RaNameQ2, Server0})),
-    ?assertMatch(#{single_active_consumer_id := {<<"ch1-ctag3">>, _}},
-                 machine_overview({RaNameQ3, Server0})),
+    ?awaitMatch(#{single_active_consumer_id := {<<"ch1-ctag1">>, _}},
+                machine_overview({RaNameQ1, Server0}), ?DEFAULT_AWAIT),
+    ?awaitMatch(#{single_active_consumer_id := {<<"ch1-ctag2">>, _}},
+                machine_overview({RaNameQ2, Server0}), ?DEFAULT_AWAIT),
+    ?awaitMatch(#{single_active_consumer_id := {<<"ch1-ctag3">>, _}},
+                machine_overview({RaNameQ3, Server0}), ?DEFAULT_AWAIT),
     ok.
 
 force_shrink_members_to_local_member(Config) ->
@@ -2077,18 +2138,18 @@ dont_leak_file_handles(Config) ->
      end || _ <- Servers],
     flush(1),
     [{_, MonBy2}] = rpc:call(Server0, erlang, process_info, [NCh1, [monitored_by]]),
-    NumMonRefsBefore = length([M || M <- MonBy2, is_reference(M)]),
+    RefsBefore = sets:from_list([M || M <- MonBy2, is_reference(M)]),
     %% delete queue
     ?assertMatch(#'queue.delete_ok'{},
                  amqp_channel:call(Ch, #'queue.delete'{queue = QQ})),
     %% File handle monitors are cleaned up asynchronously after queue
-    %% deletion. Poll until the reference monitor count decreases.
+    %% deletion. Poll until none of the monitors seen above are left.
     ?awaitMatch(
        true,
        begin
            [{_, MonBy3}] = rpc:call(Server0, erlang, process_info, [NCh1, [monitored_by]]),
-           NumMonRefsAfter = length([M || M <- MonBy3, is_reference(M)]),
-           NumMonRefsAfter < NumMonRefsBefore
+           RefsAfter = sets:from_list([M || M <- MonBy3, is_reference(M)]),
+           sets:is_empty(sets:intersection(RefsBefore, RefsAfter))
        end,
        30_000),
 
@@ -3088,6 +3149,9 @@ recover_from_multiple_failures(Config) ->
     publish(Ch, QQ),
     publish(Ch, QQ),
     publish(Ch, QQ),
+    %% The publishes above are not yet confirmed. They cannot be committed once the
+    %% second node is stopped below.
+    wait_for_messages_ready([Server], RaName, 3),
 
     ok = rabbit_ct_broker_helpers:stop_node(Config, Server2),
     assert_cluster_status({Servers, Servers, [Server]}, [Server]),
@@ -3345,6 +3409,75 @@ delete_while_publishing(Config) ->
      || N <- lists:seq(1, 50_000)],
     delete_queues(DeleterChan, [QQ]),
     ?assert(amqp_channel:wait_for_confirms_or_die(PublisherChan, ?TIMEOUT)).
+
+delete_ra_cluster_already_shutting_down(Config) ->
+    [Server | _] = Servers0 = rabbit_ct_broker_helpers:get_node_configs(Config,
+                                                                        nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>}])),
+
+    RaName = ra_name(QQ),
+    publish(Ch, QQ),
+    publish(Ch, QQ),
+    publish(Ch, QQ),
+    wait_for_messages_ready(Servers0, RaName, 3),
+
+    QName = rabbit_misc:r(<<"/">>, queue, QQ),
+    {ok, Q} = rpc:call(Server, rabbit_amqqueue, lookup, [QName]),
+
+    %% Mock ra:delete_cluster/2 to return {error, {shutdown, delete}} simulating
+    %% a cluster that is already shutting down
+    ok = rpc:call(Server, meck, new, [ra, [passthrough, no_link]]),
+    ok = rpc:call(Server, meck, expect,
+                  [ra, delete_cluster, 2,
+                   {error, {shutdown, delete}}]),
+
+    Result = rpc:call(Server, rabbit_quorum_queue, delete,
+                      [Q, false, false, <<"test-user">>]),
+    ?assertMatch({ok, _}, Result),
+
+    ok = rpc:call(Server, meck, unload, [ra]),
+
+    %% Verify the queue metadata was cleaned up
+    ?assertEqual({error, not_found},
+                 rpc:call(Server, rabbit_amqqueue, lookup, [QName])).
+
+concurrent_vhost_delete_with_quorum_queue(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    VHost = <<"concurrent_delete_vhost">>,
+    User = ?config(rmq_username, Config),
+    ok = rabbit_ct_broker_helpers:add_vhost(Config, Server, VHost, User),
+    ok = rabbit_ct_broker_helpers:set_full_permissions(Config, User, VHost),
+
+    Conn = rabbit_ct_client_helpers:open_unmanaged_connection(Config, Server, VHost),
+    {ok, Ch} = amqp_connection:open_channel(Conn),
+    [declare(Ch, <<"qq_", (integer_to_binary(N))/binary>>,
+             [{<<"x-queue-type">>, longstr, <<"quorum">>}])
+     || N <- lists:seq(1, 5)],
+    amqp_connection:close(Conn),
+
+    Self = self(),
+    Deleter = fun() ->
+        Res = rpc:call(Server, rabbit_vhost, delete, [VHost, User]),
+        Self ! {delete_result, self(), Res}
+    end,
+    Pid1 = spawn_link(Deleter),
+    Pid2 = spawn_link(Deleter),
+
+    Results = [receive {delete_result, P, R} -> R
+               after ?TIMEOUT -> ct:fail(timeout)
+               end || P <- [Pid1, Pid2]],
+
+    ?assert(lists:member(ok, Results)),
+    [case R of
+         ok -> ok;
+         {error, {no_such_vhost, _}} -> ok;
+         Other -> ct:fail({unexpected_result, Other})
+     end || R <- Results],
+
+    ?assertEqual(false, rpc:call(Server, rabbit_vhost, exists, [VHost])).
 
 sync_queue(Config) ->
     [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
@@ -4719,6 +4852,47 @@ status(Config) ->
                         rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_queue_type_ra,
                                                      status, [<<"/">>, QQ])),
     wait_for_messages(Config, [[QQ, <<"2">>, <<"2">>, <<"0">>]]),
+    ok.
+
+%% Only meaningful in a mixed-version cluster test. Since the queue's
+%% group spans all three nodes, its machine version stays pinned to
+%% whatever the oldest member supports, so local queries from the first
+%% node must still succeed instead of crashing with function_clause
+%% against that older state shape.
+mixed_version_local_queries(Config) ->
+    case rabbit_ct_helpers:is_mixed_versions() of
+        false ->
+            {skip, "mixed_version_local_queries only relevant in mixed version mode"};
+        true ->
+            mixed_version_local_queries0(Config)
+    end.
+
+mixed_version_local_queries0(Config) ->
+    [Server0 | _] = Nodes = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server0),
+    QQ = ?config(queue_name, Config),
+    RaName = ra_name(QQ),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                  {<<"x-quorum-initial-group-size">>, long, 3}])),
+    ?awaitMatch({ok, Members, _} when length(Members) == 3,
+                ra:members({RaName, Server0}),
+                ?DEFAULT_AWAIT),
+
+    publish(Ch, QQ),
+    wait_for_messages_ready(Nodes, RaName, 1),
+
+    [begin
+         ServerId = {RaName, Node},
+         [?assertMatch({ok, _, _},
+                       rabbit_ct_broker_helpers:rpc(
+                         Config, 0, rabbit_fifo_client, local_query,
+                         [ServerId, QueryFun, 5000]))
+          || QueryFun <- [query_notify_decorators_info,
+                          query_consumers,
+                          query_stat]]
+     end || Node <- Nodes],
     ok.
 
 status_noproc(Config) ->

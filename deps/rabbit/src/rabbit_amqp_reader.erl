@@ -30,7 +30,8 @@
          ensure_stats_timer/1]).
 
 -ifdef(TEST).
--export([check_node_connection_limit/1]).
+-export([check_node_connection_limit/1,
+         i/2]).
 -endif.
 
 -import(rabbit_amqp_util, [protocol_error/3]).
@@ -347,6 +348,24 @@ error_frame(Condition, Fmt, Args) ->
     #'v1_0.error'{condition = Condition,
                   description = {utf8, Description}}.
 
+%% "A valid frame header cannot be formed from the incoming byte stream." [2.8.16]
+framing_error(State, Channel, Fmt, Args) ->
+    Error = error_frame(?V_1_0_CONNECTION_ERROR_FRAMING_ERROR, Fmt, Args),
+    handle_exception(State, Channel, Error).
+
+handle_exception(State = #v1{connection_state = CS}, _Channel,
+                 Error = #'v1_0.error'{description =
+                                       {utf8, <<"Connection forced: ", Explanation/binary>>}})
+  when (?IS_RUNNING(State)) orelse CS =:= closing ->
+    %% Only ever raised by terminate/2 when the connection is deliberately
+    %% closed by an operator or by the broker itself (e.g. rabbitmqctl
+    %% close_connection, the management UI, maintenance mode draining, or
+    %% a node-wide shutdown) - never a client protocol violation, so this
+    %% does not warrant `error'-level logging. Mirrors the equivalent
+    %% AMQP 0-9-1 handling for `connection_forced' in
+    %% rabbit_reader:log_hard_error/3.
+    ?LOG_WARNING("Closing AMQP 1.0 connection ~tp: ~ts", [self(), Explanation]),
+    close(Error, State);
 handle_exception(State = #v1{connection_state = closed}, Channel,
                  #'v1_0.error'{description = {utf8, Desc}}) ->
     ?LOG_ERROR("Error on AMQP 1.0 connection ~tp (~tp), channel number ~b:~n~tp",
@@ -354,7 +373,7 @@ handle_exception(State = #v1{connection_state = closed}, Channel,
     State;
 handle_exception(State = #v1{connection_state = CS}, Channel,
                  Error = #'v1_0.error'{description = {utf8, Desc}})
-  when ?IS_RUNNING(State) orelse CS =:= closing ->
+  when (?IS_RUNNING(State)) orelse CS =:= closing ->
     ?LOG_ERROR("Error on AMQP 1.0 connection ~tp (~tp), channel number ~b:~n~tp",
                [self(), CS, Channel, Desc]),
     close(Error, State);
@@ -366,6 +385,8 @@ is_connection_frame(#'v1_0.open'{})  -> true;
 is_connection_frame(#'v1_0.close'{}) -> true;
 is_connection_frame(_)               -> false.
 
+handle_frame(_Mode, _Channel, <<>>, State) ->
+    State;
 handle_frame(Mode, Channel, Body, State) ->
     try
         handle_frame0(Mode, Channel, Body, State)
@@ -380,6 +401,16 @@ handle_frame(Mode, Channel, Body, State) ->
                                ?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS,
                                "Access for user '~ts' was refused: insufficient permissions",
                                [Username]));
+        _:{inet_error, closed} ->
+            %% Most commonly hit replying to a peer-initiated close: the
+            %% peer's socket is already gone (e.g. it disconnected right
+            %% after sending its own close frame, before we could reply
+            %% with ours). There is nobody left to notify and nothing more
+            %% useful to do, so this does not warrant a full "Reader
+            %% error" stack trace at error level.
+            ?LOG_INFO("AMQP 1.0 connection ~tp: could not reply, "
+                      "peer's socket already closed", [self()]),
+            State#v1{connection_state = closed};
         _:Reason:Trace ->
             handle_exception(State,
                              Channel,
@@ -652,24 +683,40 @@ handle_input(Handshake = <<"AMQP",0,1,0,0>>,
               %% sending any other frames." [2.4.1]
               connection_state = waiting_open},
     switch_callback(State, {frame_header, amqp}, 8);
-handle_input(Header = <<Size:32, DOff:8, Type:8, Channel:16>>,
-             State0 = #v1{callback = {frame_header, Mode}})
-  when DOff >= 2 ->
-    case {Mode, Type} of
-        {amqp, 0} -> ok;
-        {sasl, 1} -> ok;
-        _ -> throw({bad_1_0_header_type, Header, Mode})
-    end,
+handle_input(<<Size:32, DOff:8, Type:8, Channel:16>>,
+             #v1{callback = {frame_header, Mode}} = State0) ->
     MaxFrameSize = State0#v1.connection#v1_connection.incoming_max_frame_size,
-    State = if Size =:= 8 ->
+    ExpectedType = case Mode of
+                       amqp -> 0;
+                       sasl -> 1
+                   end,
+    State = if Size < 8 ->
+                   %% "The frame is malformed if the size is less than the size
+                   %% of the frame header (8 bytes)." [2.3.1]
+                   framing_error(State0, Channel,
+                                 "frame size (~b bytes) < minimum frame size (8 bytes)",
+                                 [Size]);
+               Size > MaxFrameSize ->
+                   framing_error(State0, Channel,
+                                 "frame size (~b bytes) > maximum frame size (~b bytes)",
+                                 [Size, MaxFrameSize]);
+               DOff < 2 ->
+                   %% "Due to the mandatory 8-byte frame header, the frame is
+                   %% malformed if the value is less than 2." [2.3.1]
+                   framing_error(State0, Channel,
+                                 "data offset (~b) < minimum data offset (2)",
+                                 [DOff]);
+               DOff * 4 > Size ->
+                   framing_error(State0, Channel,
+                                 "data offset (~b bytes) > frame size (~b bytes)",
+                                 [DOff * 4, Size]);
+               Type =/= ExpectedType ->
+                   framing_error(State0, Channel,
+                                 "unexpected frame type ~b in ~s mode (expected ~b)",
+                                 [Type, Mode, ExpectedType]);
+               Size =:= 8 ->
                    %% heartbeat
                    State0;
-               Size > MaxFrameSize ->
-                   Err = error_frame(
-                           ?V_1_0_CONNECTION_ERROR_FRAMING_ERROR,
-                           "frame size (~b bytes) > maximum frame size (~b bytes)",
-                           [Size, MaxFrameSize]),
-                   handle_exception(State0, Channel, Err);
                true ->
                    switch_callback(State0, {frame_body, Mode, DOff, Channel}, Size - 8)
             end,
@@ -729,7 +776,7 @@ heartbeat_send_fun(_, #v1{websocket = false,
                           sock = Sock}) ->
     fun() ->
             Frame = amqp10_binary_generator:build_heartbeat_frame(),
-            catch rabbit_net:send(Sock, Frame)
+            try rabbit_net:send(Sock, Frame) catch _:_ -> ok end
     end.
 
 auth_mechanism_to_module(TypeBin, Sock) ->
@@ -1075,12 +1122,7 @@ i(SockStat, #v1{sock = Sock})
        SockStat =:= send_oct;
        SockStat =:= send_cnt;
        SockStat =:= send_pend ->
-    case rabbit_net:getstat(Sock, [SockStat]) of
-        {ok, [{SockStat, Val}]} ->
-            Val;
-        {error, _} ->
-            ''
-    end;
+    rabbit_net:getstat_or_zero(Sock, SockStat);
 i(ssl, #v1{sock = Sock}) -> rabbit_net:is_ssl(Sock);
 i(SSL, #v1{sock = Sock, proxy_socket = ProxySock})
   when SSL =:= ssl_protocol;

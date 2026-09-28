@@ -84,6 +84,7 @@ var ALL_COLUMNS =
                    ['state',                'State',                  true]],
       'Messages': [['msgs-ready',      'Ready',          true],
                    ['msgs-unacked',    'Unacknowledged', true],
+                   ['msgs-delayed',    'Delayed',        false],
                    ['msgs-ram',        'In memory',      false],
                    ['msgs-persistent', 'Persistent',     false],
                    ['msgs-total',      'Total',          true]],
@@ -183,6 +184,12 @@ var DISABLED_STATS_COLUMNS =
                   ['to_client',    'To client',    false],
                   ['heartbeat',    'Heartbeat',    false],
                   ['connected_at', 'Connected at', false]]},
+
+     'channels':
+     {'Overview': [['user', 'User name', true]],
+      'Details': [],
+      'Transactions': [],
+      'Message rates': []},
 
      'vhosts':
      {'Overview': [['cluster-state',   'Cluster state',  false]]}};
@@ -313,7 +320,7 @@ var HELP = {
       'Only users within the internal RabbitMQ database are shown here. Other users (e.g. those authenticated over LDAP) will not appear.',
 
     'export-definitions':
-    'The definitions consist of users, virtual hosts, permissions, parameters, exchanges, queues, policies and bindings. They do not include the contents of queues. Exclusive queues will not be exported.',
+    'The definitions consist of users, virtual hosts, permissions, parameters, exchanges, queues, policies and bindings. They do not include the contents of queues. Exclusive queues will not be exported. The download filename may only contain token characters (letters, digits and !#$%&\'*+-.^_`|~).',
 
     'export-definitions-vhost':
     'The definitions exported for a single virtual host consist of exchanges, queues, bindings and policies.',
@@ -514,11 +521,12 @@ var HELP = {
     When single active consumer is enabled for the queue, only one consumer at a time is active. \
     When single active consumer is disabled for the queue, consumers are active by default. \
     For a quorum queue, a consumer can be inactive because its owning node is suspected down. <br/><br/> \
-    (<a href="https://www.rabbitmq.com/consumers.html#active-consumer" target="_blank">Documentation</a>)',
+    (<a href="https://www.rabbitmq.com/docs/consumers#active-consumer" target="_blank">Documentation</a>)',
 
     'consumer-owner' :
-    '<a href="https://www.rabbitmq.com/consumers.html">AMQP 0-9-1 consumers</a> belong to a channel, \
-    and <a href="https://www.rabbitmq.com/stream.html">stream consumers</a> belong to a stream connection.',
+    '<a href="https://www.rabbitmq.com/docs/consumers" target="_blank">AMQP 0-9-1 consumers</a> belong to a channel, \
+    <a href="https://www.rabbitmq.com/docs/stream" target="_blank">stream consumers</a> belong to a stream connection, \
+    and consumers of channel-less protocols (e.g. MQTT) belong to a connection.',
 
     'plugins' :
     'Note that only plugins which are both explicitly enabled and running are shown here.',
@@ -764,7 +772,7 @@ function setup_global_vars(overview) {
     user_administrator = jQuery.inArray("administrator", user_tags) != -1;
     is_user_policymaker = jQuery.inArray("policymaker", user_tags) != -1;
     user_monitor = jQuery.inArray("monitoring", user_tags) != -1;
-    exchange_types = overview.exchange_types.map(function(xt) { return xt.name; });
+    exchange_types = overview.exchange_types.map(function(xt) { return fmt_escape_html_one_line(xt.name); });
 
     cluster_name = fmt_escape_html(overview.cluster_name);
     $('#logout').before(

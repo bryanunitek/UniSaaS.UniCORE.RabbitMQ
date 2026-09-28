@@ -6,15 +6,18 @@
   "scripts": {
     "fakeportal": "node fakeportal/app.js",
     "fakeproxy": "node fakeportal/proxy.js",
-    "test": " eval $(cat $ENV_FILE ) && mocha --recursive --trace-warnings --timeout 40000"
+    "test": ". $ENV_FILE && mocha --trace-warnings --timeout 40000"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
+  "overrides": {
+    "proxy-agent": "6.5.0"
+  },
   "dependencies": {
-    "amqplib": "1.0.3",
-    "chromedriver": "^147.0.1",
-    "ejs": "^5.0.1",
+    "amqplib": "2.0.1",
+    "chromedriver": "^151.0.0",
+    "ejs": "^6.0.1",
     "express": "^5.1.0",
     "geckodriver": "^6.0.2",
     "http-proxy": "^1.18.1",
@@ -27,8 +30,6 @@
   },
   "devDependencies": {
     "chai": "^6.2.0",
-    "mocha": "^11.7.4",
-    "request": "^2.88.2",
-    "standard": "^17.1.2"
+    "mocha": "^11.7.4"
   }
 }

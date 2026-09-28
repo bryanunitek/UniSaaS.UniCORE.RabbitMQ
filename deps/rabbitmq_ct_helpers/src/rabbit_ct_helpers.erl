@@ -1052,7 +1052,7 @@ is_mixed_versions(Config) ->
 %% -------------------------------------------------------------------
 
 await_condition(ConditionFun) ->
-    await_condition(ConditionFun, 10_000).
+    await_condition(ConditionFun, 15_000).
 
 await_condition(ConditionFun, Timeout) ->
     Retries = ceil(Timeout / 50),
@@ -1103,7 +1103,7 @@ eventually({Line, Assertion} = TestObj, PollInterval, PollCount)
   when is_integer(Line), Line >= 0, is_function(Assertion, 0),
        is_integer(PollInterval), PollInterval >= 0,
        is_integer(PollCount), PollCount > 0 ->
-    case catch Assertion() of
+    case try Assertion() catch _:E -> {error, E} end of
         ok ->
             ok;
         Err ->

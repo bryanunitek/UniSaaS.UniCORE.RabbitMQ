@@ -671,8 +671,8 @@ apply_(Meta, {nodeup, Node}, #?STATE{consumers = Cons0,
     {State1, Effects1} =
         maps:fold(
           fun(ConsumerKey,
-              ?CONSUMER_PID(P) =
-              #consumer{status = {suspected_down, _}} = C0,
+              #consumer{cfg = #consumer_cfg{pid = P},
+                        status = {suspected_down, _}} = C0,
               {SAcc, EAcc0})
                 when node(P) =:= Node ->
                   #consumer{status = NextStatus} = C =
@@ -1299,11 +1299,12 @@ init_aux(Name) when is_atom(Name) ->
                                       messages_total = 0,
                                       min_reclaimable = MinReclaimable}}.
 
-handle_aux(RaftState, Tag, Cmd, AuxV2, RaAux)
-  when element(1, AuxV2) == aux_v2 ->
-    Name = element(2, AuxV2),
-    AuxV3 = init_aux(Name),
-    handle_aux(RaftState, Tag, Cmd, AuxV3, RaAux);
+handle_aux(RaftState, Tag, Cmd, AuxPre, RaAux)
+  when element(1, AuxPre) == aux_v2 orelse
+       element(1, AuxPre) == aux ->
+    Name = element(2, AuxPre),
+    Aux = init_aux(Name),
+    handle_aux(RaftState, Tag, Cmd, Aux, RaAux);
 handle_aux(RaftState, Tag, Cmd, AuxV3, RaAux)
   when element(1, AuxV3) == aux_v3 ->
     AuxV4 = #?AUX{name = element(2, AuxV3),
@@ -1885,8 +1886,8 @@ activate_next_consumer(#?STATE{consumers = Cons0,
                                                      true, single_active,
                                                      Effects0),
             {State, Effects};
-        {{ActiveCKey, ?CONSUMER_PRIORITY(ActivePriority) =
-                      #consumer{checked_out = ActiveChecked} = Active},
+        {{ActiveCKey, #consumer{cfg = #consumer_cfg{priority = ActivePriority},
+                                checked_out = ActiveChecked} = Active},
          {NextCKey, ?CONSUMER_PRIORITY(WaitingPriority) = Consumer}}
           when WaitingPriority > ActivePriority andalso
                map_size(ActiveChecked) == 0 ->
@@ -3177,8 +3178,8 @@ add_waiting({Key, _} = New, Waiting) ->
 
 sort_waiting(Waiting) ->
     lists:sort(fun
-                   ({_, ?CONSUMER_PRIORITY(P1) = #consumer{status = up}},
-                    {_, ?CONSUMER_PRIORITY(P2) = #consumer{status = up}})
+                   ({_, #consumer{cfg = #consumer_cfg{priority = P1}, status = up}},
+                    {_, #consumer{cfg = #consumer_cfg{priority = P2}, status = up}})
                      when P1 =/= P2 ->
                        P2 =< P1;
                    ({C1, #consumer{status = up,

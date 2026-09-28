@@ -323,7 +323,9 @@ simple_stream(Config, AckMode, NMsgs) ->
               amqp10_declare_queue(Sess, Src, #{<<"x-queue-type">> => {utf8, <<"stream">>}}),
               amqp10_declare_queue(Sess, Dest, #{<<"x-queue-type">> => {utf8, <<"stream">>}}),
               set_param(Config, Param,
-                        ?config(shovel_args, Config) ++ [{<<"ack-mode">>, AckMode}]),
+                        ?config(shovel_args, Config) ++
+                        [{<<"ack-mode">>, AckMode},
+                         {<<"src-consumer-args">>, #{<<"x-stream-offset">> => <<"first">>}}]),
               DestAddress = rabbitmq_amqp_address:queue(Dest),
               Receiver = amqp10_subscribe(Sess, DestAddress),
               SrcAddress = rabbitmq_amqp_address:queue(Src),
@@ -712,10 +714,11 @@ list_queue_messages(Config, QName) ->
     List = rabbit_ct_broker_helpers:rabbitmqctl_list(
              Config, 0,
              ["list_queues", "name", "messages", "--no-table-headers"]),
-    [[_, Messages]] = lists:filter(fun([Q, _]) ->
-                                           Q == QName
-                                   end, List),
-    binary_to_integer(Messages).
+    case lists:filter(fun([Q, _]) -> Q == QName end, List) of
+        [[_, Messages]] -> binary_to_integer(Messages);
+        %% the queue may have been deleted between the delete call and this check
+        [] -> 0
+    end.
 
 delete_queue(Name, VHost) ->
     QName = rabbit_misc:r(VHost, queue, Name),

@@ -219,6 +219,13 @@
                     {mfa,         {rabbit_logger_exchange_h, declare_exchange, []}},
                     {requires,    [core_initialized, recovery]}]}).
 
+-rabbit_boot_step({channel_interceptor_priorities_check,
+                   [{description, "warn about channel interceptor priorities that match no registered interceptor"},
+                    {mfa,         {rabbit_channel_interceptor,
+                                   warn_unknown_priorities, []}},
+                    {requires,    recovery},
+                    {enables,     routing_ready}]}).
+
 -rabbit_boot_step({routing_ready,
                    [{description, "message delivery logic ready"},
                     {requires,    [core_initialized, recovery]}]}).
@@ -455,9 +462,10 @@ spawn_boot_marker() ->
     %% We register a process doing nothing to indicate that RabbitMQ is
     %% booting. This is checked by `is_booting(Node)` on a remote node.
     Marker = spawn_link(fun() -> receive stop -> ok end end),
-    case catch register(rabbit_boot, Marker) of
-        true -> {ok, Marker};
-        _    -> {already_booting, Marker}
+    try register(rabbit_boot, Marker) of
+        true -> {ok, Marker}
+    catch
+        _:_ -> {already_booting, Marker}
     end.
 
 stop_boot_marker(Marker) ->
@@ -1049,6 +1057,15 @@ do_run_postlaunch_phase(Plugins) ->
 
         %% Start listeners after all plugins have been enabled,
         %% see rabbitmq/rabbitmq-server#2405.
+        case application:get_env(rabbit, listeners_startup_delay, 0) of
+            Delay when is_integer(Delay), Delay > 0 ->
+                ?LOG_INFO("Delaying startup of client connection listeners by ~b seconds", [Delay]),
+                timer:sleep(Delay * 1000);
+            0 ->
+                ok;
+            Delay ->
+                ?LOG_WARNING("Ignoring invalid listeners.startup_delay value ~tp", [Delay])
+        end,
         ?LOG_INFO("Ready to start client connection listeners"),
         ok = rabbit_networking:boot(),
 
@@ -1378,11 +1395,7 @@ print_banner() ->
               CfgLocations).
 
 emu_flavor() ->
-    %% emu_flavor was introduced in Erlang 24 so we need to catch the error on Erlang 23
-    case catch(erlang:system_info(emu_flavor)) of
-        {'EXIT', _} -> "emu";
-        EmuFlavor -> EmuFlavor
-    end.
+    erlang:system_info(emu_flavor).
 
 crypto_version() ->
     [{CryptoLibName, _, CryptoLibVersion}] = crypto:info_lib(),
@@ -1467,7 +1480,8 @@ product_name() ->
 
 -spec product_license_line() -> string().
 product_license_line() ->
-    application:get_env(rabbit, license_line, ?INFORMATION_MESSAGE).
+    {ok, Val} = application:get_env(rabbit, license_line),
+    Val.
 
 -spec product_version() -> string().
 

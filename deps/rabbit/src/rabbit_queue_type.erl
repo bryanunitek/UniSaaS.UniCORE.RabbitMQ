@@ -79,7 +79,8 @@
          added_to_rabbit_registry/2,
          removed_from_rabbit_registry/1,
          known_queue_type_names/0,
-         known_queue_type_modules/0
+         known_queue_type_modules/0,
+         validate_default_queue_type/1
         ]).
 
 -type queue_name() :: rabbit_amqqueue:name().
@@ -312,11 +313,19 @@
 -spec discover(binary() | atom()) -> queue_type().
 discover(<<"undefined">>) ->
     fallback();
+discover(<<>>) ->
+    fallback();
 discover(undefined) ->
     fallback();
 discover(TypeDescriptor) ->
-    {ok, TypeModule} = rabbit_registry:lookup_type_module(queue, TypeDescriptor),
-    TypeModule.
+    case rabbit_registry:lookup_type_module(queue, TypeDescriptor) of
+        {ok, TypeModule} ->
+            TypeModule;
+        {error, not_found} ->
+            rabbit_misc:protocol_error(
+              precondition_failed, "unknown queue type '~ts'",
+              [rabbit_data_coercion:to_binary(TypeDescriptor)])
+    end.
 
 -spec short_alias_of(TypeDescriptor) -> Ret when
       TypeDescriptor :: {utf8, binary()} | atom() | binary(),
@@ -858,6 +867,38 @@ known_queue_type_names() ->
     {QueueTypes, _} = lists:unzip(Registered),
     lists:map(fun(X) -> atom_to_binary(X) end, QueueTypes).
 
+-spec validate_default_queue_type(Value) -> Ret when
+      Value :: any(),
+      Ret :: ok | {error, binary()}.
+validate_default_queue_type(undefined) -> ok;
+validate_default_queue_type(null) -> ok;
+validate_default_queue_type(nil) -> ok;
+validate_default_queue_type(<<"undefined">>) -> ok;
+validate_default_queue_type(<<>>) ->
+    {error, <<"default_queue_type must not be an empty string">>};
+validate_default_queue_type(Value) when is_binary(Value); is_atom(Value) ->
+    ValBin = rabbit_data_coercion:to_binary(Value),
+    try discover(Value) of
+        QueueType when is_atom(QueueType) ->
+            case is_enabled(QueueType) of
+                true ->
+                    ok;
+                false ->
+                    Msg = rabbit_data_coercion:to_binary(
+                            rabbit_misc:format(
+                              "queue type ~ts is not enabled", [ValBin])),
+                    {error, Msg}
+            end
+    catch _:_ ->
+              Msg = rabbit_data_coercion:to_binary(
+                      rabbit_misc:format("~ts is not a valid queue type", [ValBin])),
+              {error, Msg}
+    end;
+validate_default_queue_type(Other) ->
+    Msg = rabbit_data_coercion:to_binary(
+            rabbit_misc:format("~tp is not a valid default_queue_type value", [Other])),
+    {error, Msg}.
+
 inject_dqt(VHost) when ?is_vhost(VHost) ->
     inject_dqt(vhost:to_map(VHost));
 inject_dqt(VHost) when is_list(VHost) ->
@@ -871,6 +912,7 @@ inject_dqt(M) when is_map(M) ->
         nil -> default();
         <<"undefined">> -> default();
         "undefined" -> default();
+        <<>> -> default();
         Valid -> Valid
     end,
     NQT = short_alias_of(DQT),
@@ -911,15 +953,24 @@ get_consumer_timeout(#{timeout := Timeout}, _Q)
     Timeout;
 get_consumer_timeout(_, Q) ->
     case rabbit_queue_type_util:args_policy_lookup(<<"consumer-timeout">>,
-                                                   fun (X, Y) ->
-                                                           erlang:min(X, Y)
-                                                   end, Q) of
+                                                   fun erlang:min/2, Q) of
         undefined ->
-            %% strict assertion, it is not valid to unset the consumer_timeout
-            %% environment variable or set it to an invalid value
-            {ok, MS} = application:get_env(rabbit, consumer_timeout),
-            true = is_integer(MS),
-            MS;
+            case application:get_env(rabbit, consumer_timeout) of
+                {ok, MS} when is_integer(MS) ->
+                    MS;
+                {ok, Other} ->
+                    %% Non-integer values (e.g. undefined) are not valid.
+                    %% Default to 24 hours.
+                    ?LOG_WARNING("consumer_timeout is set to an invalid value: ~tp, "
+                                 "defaulting to 86400000ms (24 hours)",
+                                 [Other]),
+                    86_400_000;
+                undefined ->
+                    %% The application default in rabbit.app is 1800000, so this
+                    %% branch is unreachable in practice unless explicitly configured.
+                    %% Default to 24 hours
+                    86_400_000
+            end;
         Val when is_integer(Val) ->
             Val
     end.
