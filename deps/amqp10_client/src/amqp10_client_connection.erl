@@ -23,7 +23,8 @@
          socket_ready/2,
          protocol_header_received/5,
          begin_session/1,
-         heartbeat/1]).
+         heartbeat/1,
+         obfuscate_config/1]).
 
 %% gen_statem callbacks
 -export([init/1,
@@ -59,6 +60,8 @@
       address => address(),
       port => inet:port_number(),
       tls_opts => {secure_port, [ssl:tls_option()]},
+      %% socket connect timeout, for TLS applied to the TCP connect and the TLS handshake separately
+      connect_timeout => timeout(),
       ws_path => string(),
       ws_opts => gun:opts(),
       notify => pid() | none, % the pid to send connection events to
@@ -484,19 +487,28 @@ format_status(Context = #{data := ProcState}) ->
 %% Internal functions.
 %% -------------------------------------------------------------------
 
-obfuscate_state(State = #state{config = Cfg0}) ->
-    Cfg1 = obfuscate_state_config_sasl(Cfg0),
-    Cfg2 = obfuscate_state_config_tls_opts(Cfg1),
-    State#state{config = Cfg2}.
+obfuscate_state(State = #state{config = Cfg}) ->
+    State#state{config = obfuscate_config(Cfg)}.
+
+-spec obfuscate_config(connection_config()) -> connection_config().
+obfuscate_config(Cfg) ->
+    obfuscate_state_config_tls_opts(obfuscate_state_config_sasl(Cfg)).
 
 -spec obfuscate_state_config_sasl(connection_config()) -> connection_config().
 obfuscate_state_config_sasl(Cfg) ->
     Sasl0 = maps:get(sasl, Cfg, none),
     Sasl = case Sasl0 of
+               none -> none;
+               anon -> anon;
+               external -> external;
                {plain, Username, _Password} ->
                    {plain, Username, <<"[redacted]">>};
-               Other ->
-                   Other
+               {plaintext, _} ->
+                   {plaintext, <<"[redacted]">>};
+               {encrypted, _} ->
+                   {encrypted, <<"[redacted]">>};
+               _ ->
+                   {plaintext, <<"[redacted]">>}
            end,
     Cfg#{sasl => Sasl}.
 

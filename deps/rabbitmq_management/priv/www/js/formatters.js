@@ -22,7 +22,7 @@ const CONSUMER_OWNER_FORMATTERS = [
         if (cd.name) {
             return link_channel(cd.name);
         }
-        // Consumers of channel-less protocols (e.g. MQTT) belong
+        // Consumers of other protocols (AMQP 1.0, MQTT, STOMP) belong
         // directly to a connection.
         if (cd.connection_name) {
             return link_conn(cd.connection_name);
@@ -529,7 +529,8 @@ function fmt_escape_html0(txt) {
     return ("" + txt).replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
-        .replace(/\"/g, '&quot;');
+        .replace(/\"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 function fmt_maybe_wrap(txt, encoding) {

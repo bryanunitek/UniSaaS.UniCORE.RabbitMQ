@@ -284,20 +284,12 @@ reply(Facts, ReqData, Context) ->
 
 reply0(Facts, ReqData, Context) ->
     ReqData1 = cowboy_req:set_resp_header(<<"cache-control">>, "no-cache", ReqData),
-    try
-        case maps:get(media_type, ReqData1, undefined) of
-            {<<"application">>, <<"bert">>, _} ->
-                {term_to_binary(Facts), ReqData1, Context};
-            _ ->
-                {rabbit_json:encode(rabbit_mgmt_format:prepare_for_encoding(Facts)),
-                 ReqData1, Context}
-        end
-    catch exit:{json_encode, E} ->
-            Error = iolist_to_binary(
-                      io_lib:format("JSON encode error: ~tp", [E])),
-            Reason = iolist_to_binary(
-                       io_lib:format("While encoding: ~n~tp", [Facts])),
-            internal_server_error(Error, Reason, ReqData1, Context)
+    case maps:get(media_type, ReqData1, undefined) of
+        {<<"application">>, <<"bert">>, _} ->
+            {term_to_binary(Facts), ReqData1, Context};
+        _ ->
+            {rabbit_json:encode(rabbit_mgmt_format:prepare_for_encoding(Facts)),
+             ReqData1, Context}
     end.
 
 reply_list(Facts, ReqData, Context) ->
@@ -663,10 +655,14 @@ get_dotted_value0([Key | Keys], Item) ->
 pget_bin(Key, Map, Default) when is_map(Map) ->
     maps:get(Key, Map, Default);
 pget_bin(Key, List, Default) when is_list(List) ->
-    case lists:partition(fun ({K, _V}) -> a2b(K) =:= Key end, List) of
-        {[{_K, V}], _} -> V;
-        {[],        _} -> Default
-    end.
+    case lists:search(fun ({K, _V}) -> a2b(K) =:= Key;
+                          (_)       -> false
+                      end, List) of
+        {value, {_K, V}} -> V;
+        false            -> Default
+    end;
+pget_bin(_Key, _Other, Default) ->
+    Default.
 maybe_pagination(Item, false, ReqData) ->
     extract_column_items(Item, columns(ReqData));
 maybe_pagination([{items, Item} | T], true, ReqData) ->
@@ -976,8 +972,7 @@ direct_request(MethodName, Transformers, Extra, ErrorMsg, ReqData,
 with_vhost_and_props(Fun, ReqData, Context) ->
     case vhost(ReqData) of
         not_found ->
-            not_found(rabbit_data_coercion:to_binary("vhost_not_found"),
-                      ReqData, Context);
+            not_found(<<"Not Found">>, ReqData, Context);
         VHost ->
             case read_complete_body(ReqData) of
                 {error, http_body_limit_exceeded, LimitApplied, BytesRead} ->
@@ -1358,7 +1353,7 @@ sublist(List, S, L) when is_integer(L), L >= 0 ->
 set_resp_not_found(NotFoundBin, ReqData) ->
     ErrorMessage = case rabbit_mgmt_util:vhost(ReqData) of
         not_found ->
-            <<"vhost_not_found">>;
+            <<"Not Found">>;
         _ ->
             NotFoundBin
     end,

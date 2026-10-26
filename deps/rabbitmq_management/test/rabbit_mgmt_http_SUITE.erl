@@ -170,10 +170,12 @@ all_tests() -> [
     quorum_queues_test,
     stream_queues_have_consumers_field,
     bindings_post_test,
+    bindings_post_non_object_body_test,
     bindings_null_routing_key_test,
     bindings_e2e_test,
     permissions_administrator_test,
     permissions_vhost_test,
+    permissions_vhost_existence_disclosure_test,
     permissions_amqp_test,
     permissions_queue_delete_test,
     permissions_connection_channel_consumer_test,
@@ -242,6 +244,7 @@ all_tests() -> [
     connections_amqpl,
     connections_amqp,
     amqp_sessions,
+    amqp_consumer_channel_details,
     amqpl_sessions,
     enable_plugin_amqp,
     cluster_and_node_tags_test,
@@ -390,6 +393,11 @@ end_per_testcase0(permissions_vhost_test, Config) ->
     rabbit_ct_broker_helpers:delete_vhost(Config, <<"myvhost2">>),
     rabbit_ct_broker_helpers:delete_user(Config, <<"myuser1">>),
     rabbit_ct_broker_helpers:delete_user(Config, <<"myuser2">>),
+    Config;
+end_per_testcase0(permissions_vhost_existence_disclosure_test, Config) ->
+    rabbit_ct_broker_helpers:delete_vhost(Config, <<"nfd_vhost">>),
+    rabbit_ct_broker_helpers:delete_user(Config, <<"nfd_user">>),
+    rabbit_ct_broker_helpers:delete_user(Config, <<"nfd_policy_user">>),
     Config;
 end_per_testcase0(config_environment_test, Config) ->
     rpc(Config, application, unset_env, [rabbit, config_environment_test_env]),
@@ -1385,6 +1393,53 @@ amqp_sessions(Config) ->
     ok = rabbitmq_amqp_client:detach_management_link_pair_sync(LinkPair),
     ok = amqp10_client:close_connection(C).
 
+%% Test that an AMQP 1.0 consumer is reported with the details of its
+%% connection: an AMQP 1.0 session is neither a channel nor a connection.
+amqp_consumer_channel_details(Config) ->
+    QName = <<"amqp-consumer-channel-details">>,
+    QPath = "/queues/%2F/" ++ binary_to_list(QName),
+    http_put(Config, QPath, [{durable, true}], {group, '2xx'}),
+    User = <<"amqp-consumer-user">>,
+    rabbit_ct_broker_helpers:add_user(Config, User, User),
+    rabbit_ct_broker_helpers:set_user_tags(Config, 0, User, [management]),
+    rabbit_ct_broker_helpers:set_full_permissions(Config, User, <<"/">>),
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_amqp),
+    OpnConf = #{address => ?config(rmq_hostname, Config),
+                port => Port,
+                container_id => <<"my container">>,
+                sasl => {plain, User, User}},
+    {ok, C} = amqp10_client:open_connection(OpnConf),
+    receive {amqp10_event, {connection, C, opened}} -> ok
+    after 5000 -> ct:fail(opened_timeout)
+    end,
+    {ok, Session} = amqp10_client:begin_session_sync(C),
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session, <<"my receiver">>,
+                       rabbitmq_amqp_address:queue(QName)),
+    receive {amqp10_event, {link, Receiver, attached}} -> ok
+    after 5000 -> ct:fail({missing_event, ?LINE})
+    end,
+
+    eventually(?_assertEqual(1, length(http_get(Config, "/connections"))), 1000, 10),
+    [#{name := ConnectionName}] = http_get(Config, "/connections"),
+    eventually(?_assertMatch(
+                  [#{channel_details := #{name := <<>>,
+                                          number := 0,
+                                          user := User,
+                                          connection_name := ConnectionName}}],
+                  http_get(Config, "/consumers")), 1000, 10),
+    ?assertMatch(#{consumer_details := [#{channel_details := #{name := <<>>,
+                                                               connection_name := ConnectionName}}]},
+                 http_get(Config, QPath)),
+    %% Users without the monitoring tag only see consumers of their own connections.
+    ?assertMatch([#{channel_details := #{connection_name := ConnectionName}}],
+                 http_get(Config, "/consumers", User, User, ?OK)),
+
+    ok = amqp10_client:detach_link(Receiver),
+    ok = amqp10_client:close_connection(C),
+    http_delete(Config, QPath, {group, '2xx'}),
+    rabbit_ct_broker_helpers:delete_user(Config, User).
+
 %% Test that GET /connections/:name/sessions returns
 %% 400 Bad Request for non-AMQP 1.0 connections.
 amqpl_sessions(Config) ->
@@ -1714,6 +1769,12 @@ bindings_post_test(Config) ->
     http_delete(Config, "/queues/%2F/myqueue", {group, '2xx'}),
     passed.
 
+bindings_post_non_object_body_test(Config) ->
+    Path = "/bindings/%2F/e/amq.direct/q/myqueue",
+    http_post_json(Config, Path, <<"[]">>, ?BAD_REQUEST),
+    http_post_json(Config, Path, <<"\"str\"">>, ?BAD_REQUEST),
+    passed.
+
 bindings_null_routing_key_test(Config) ->
     http_delete(Config, "/exchanges/%2F/myexchange", {one_of, [201, 404]}),
     XArgs = [{type, <<"direct">>}],
@@ -1884,6 +1945,60 @@ permissions_vhost_test(Config) ->
     http_delete(Config, "/vhosts/myvhost2", {group, '2xx'}),
     http_delete(Config, "/users/myuser", {group, '2xx'}),
     http_delete(Config, "/users/myadmin", {group, '2xx'}),
+    passed.
+
+permissions_vhost_existence_disclosure_test(Config) ->
+    QArgs = #{durable => true},
+    PermArgs = [{configure, <<".*">>}, {write, <<".*">>}, {read, <<".*">>}],
+    http_put(Config, "/users/nfd_user", [{password, <<"nfd_user">>},
+                                         {tags, <<"management">>}], {group, '2xx'}),
+    http_put(Config, "/vhosts/nfd_vhost", none, {group, '2xx'}),
+    http_put(Config, "/permissions/nfd_vhost/guest", PermArgs, {group, '2xx'}),
+    http_put(Config, "/queues/nfd_vhost/nfd_queue", QArgs, {group, '2xx'}),
+
+    GetBody = fun(Path) ->
+                      Body = http_get_no_decode(Config, Path, "nfd_user", "nfd_user",
+                                                 ?NOT_FOUND),
+                      rabbit_json:decode(Body)
+              end,
+    %% ExistingVhostNoPerm is rejected by `is_authorized/2`
+    %% before `resource_exists/2` runs.
+    ExistingVhostNoPerm = GetBody("/queues/nfd_vhost/nfd_queue"),
+    NonExistentVhost    = GetBody("/queues/does-not-exist-nfd-vhost/nfd_queue"),
+    ?assertEqual(<<"not_found">>, maps:get(<<"error">>, ExistingVhostNoPerm)),
+    ?assertEqual(ExistingVhostNoPerm, NonExistentVhost),
+
+    ReqBody = fun(User, Method, Path, Body) ->
+                      {ok, {{_, 404, _}, _, RespBody}} =
+                          req(Config, 0, Method, Path,
+                              [auth_header(User, User),
+                               {"content-type", "application/json"}],
+                              rabbit_json:encode(Body)),
+                      rabbit_json:decode(RespBody)
+              end,
+    NotFound = #{<<"error">> => <<"not_found">>, <<"reason">> => <<"Not Found">>},
+
+    ?assertEqual(NotFound, ReqBody("nfd_user", put, "/queues/nfd_vhost/some-other-queue", QArgs)),
+    ?assertEqual(NotFound,
+                 ReqBody("nfd_user", put, "/queues/does-not-exist-nfd-vhost/some-other-queue",
+                         QArgs)),
+
+    ?assertEqual(NotFound, ReqBody("nfd_user", post, "/queues/nfd_vhost/nfd_queue/get", #{})),
+    ?assertEqual(NotFound,
+                 ReqBody("nfd_user", post, "/queues/does-not-exist-nfd-vhost/nfd_queue/get", #{})),
+
+    http_put(Config, "/users/nfd_policy_user", [{password, <<"nfd_policy_user">>},
+                                                {tags, <<"policymaker">>}], {group, '2xx'}),
+    Policy = #{pattern => <<".*">>, definition => #{'max-length' => 1}},
+    ?assertEqual(NotFound,
+                 ReqBody("nfd_policy_user", put, "/policies/nfd_vhost/nfd_policy", Policy)),
+    ?assertEqual(NotFound,
+                 ReqBody("nfd_policy_user", put,
+                         "/policies/does-not-exist-nfd-vhost/nfd_policy", Policy)),
+
+    http_delete(Config, "/vhosts/nfd_vhost", {group, '2xx'}),
+    http_delete(Config, "/users/nfd_user", {group, '2xx'}),
+    http_delete(Config, "/users/nfd_policy_user", {group, '2xx'}),
     passed.
 
 permissions_amqp_test(Config) ->
