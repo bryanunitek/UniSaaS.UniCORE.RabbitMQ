@@ -31,7 +31,7 @@
                             amqp10_expect_empty/2,
                             amqp10_subscribe/2,
                             make_uri/2, make_uri/3,
-                            make_uri/5,
+                            make_uri/4, make_uri/5,
                             await_no_shovel/2
                            ]).
 
@@ -55,17 +55,17 @@ groups() ->
      %% so it messes up all other parallel tests
      {amqp10, [], [{parallel, [parallel], tests()},
                    {sequential, [], [disk_alarm]}]},
-     {local, [parallel], tests() ++ [disk_alarm]},
+     {local, [parallel], tests() ++ local_src_tests() ++ local_dest_tests() ++ [disk_alarm]},
      {amqp091_to_amqp10, [], [{parallel, [parallel], tests()},
                               {sequential, [], [disk_alarm]}]},
-     {amqp091_to_local, [parallel], tests() ++ [disk_alarm]},
+     {amqp091_to_local, [parallel], tests() ++ local_dest_tests() ++ [disk_alarm]},
      {amqp10_to_amqp091, [], [{parallel, [parallel], tests()},
                               {sequential, [], [disk_alarm]}]},
-     {amqp10_to_local, [parallel], tests()},
+     {amqp10_to_local, [parallel], tests() ++ local_dest_tests()},
      {amqp10_to_local, [], [{parallel, [parallel], tests()},
                             {sequential, [], [disk_alarm]}]},
-     {local_to_amqp091, [parallel], tests() ++ [disk_alarm]},
-     {local_to_amqp10, [], [{parallel, [parallel], tests()},
+     {local_to_amqp091, [parallel], tests() ++ local_src_tests() ++ [disk_alarm]},
+     {local_to_amqp10, [], [{parallel, [parallel], tests() ++ local_src_tests()},
                             {sequential, [], [disk_alarm]}]}
     ].
 
@@ -102,12 +102,8 @@ tests() ->
      autodelete_quorum_on_confirm_no_transfer,
      autodelete_classic_on_publish_no_transfer,
      autodelete_quorum_on_publish_no_transfer,
-     %% AMQP091 and local shovels requeue messages on reject
-     %% while AMQP10 discards messages on reject.
-     %% These two tests will remain commented out until a decision on
-     %% which behavior to adopt for both is made and implemented.
-     %% autodelete_classic_on_confirm_with_rejections,
-     %% autodelete_quorum_on_confirm_with_rejections,
+     autodelete_classic_on_confirm_with_rejections,
+     autodelete_quorum_on_confirm_with_rejections,
      autodelete_classic_on_publish_with_rejections,
      autodelete_quorum_on_publish_with_rejections,
      no_vhost_access,
@@ -116,8 +112,25 @@ tests() ->
      delete_src_queue,
      shovel_status,
      change_definition,
-     consumer_tag
+     consumer_tag,
+     dest_rejects_quorum_source,
+     dest_rejects_classic_source
     ].
+
+%% Only meaningful for a local source. With an AMQP 0-9-1 or AMQP 1.0
+%% source, the protocol enforces read access when the consumer is set up,
+%% so the shovel fails to start either way but the local check is never
+%% reached.
+local_src_tests() ->
+    [no_read_access_on_source_queue].
+
+%% Only meaningful for a local destination, where write access is checked
+%% per message. With an AMQP 0-9-1 or AMQP 1.0 destination, the protocol
+%% enforces write access when the publisher is set up, so the shovel never
+%% reaches the running state.
+local_dest_tests() ->
+    [no_write_access_on_dest_queue,
+     write_access_on_default_exchange_only].
 
 %% -------------------------------------------------------------------
 %% Testsuite setup/teardown.
@@ -266,7 +279,7 @@ end_per_testcase(Testcase, Config) ->
     shovel_test_utils:clear_param(Config, ?config(param, Config)),
     Src = ?config(srcq, Config),
     Dest = ?config(destq, Config),
-    Queues = [rabbit_misc:r(<<"/">>, queue, Src), rabbit_misc:r(<<"/">>, queue, Dest)],
+    Queues = [rabbit_misc:r(<<"/">>, queue, Q) || Q <- [Src, Dest, dlq(Src)]],
     rabbit_ct_broker_helpers:rpc(Config, 0, shovel_test_utils, delete_queues, [Queues]),
     _ = rabbit_ct_broker_helpers:delete_vhost(Config, ?config(alt_vhost, Config)),
     rabbit_ct_helpers:testcase_finished(Config, Testcase).
@@ -562,6 +575,84 @@ no_user_access(Config) ->
            [<<"/">>, <<"shovel">>, Param, ShovelArgs, none]),
     await_no_shovel(Config, Param).
 
+%% Grant configure and write but deny read, so only the source-side
+%% permission check can block the shovel from starting.
+no_read_access_on_source_queue(Config) ->
+    Param = ?config(param, Config),
+    RestrictedUser = <<"restricted_", Param/binary>>,
+    rabbit_ct_broker_helpers:add_user(Config, RestrictedUser, RestrictedUser),
+    rabbit_ct_broker_helpers:set_permissions(
+      Config, RestrictedUser, <<"/">>, <<".*">>, <<".*">>, <<"^$">>),
+    Uri = make_uri(Config, 0, RestrictedUser, RestrictedUser),
+    ExtraArgs = [{<<"src-uri">>, Uri}, {<<"dest-uri">>, [Uri]}],
+    ShovelArgs = ?config(shovel_args, Config) ++ ExtraArgs,
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, rabbit_runtime_parameters, set,
+           [<<"/">>, <<"shovel">>, Param, ShovelArgs, none]),
+    try
+        await_no_shovel(Config, Param)
+    after
+        rabbit_ct_broker_helpers:delete_user(Config, RestrictedUser)
+    end.
+
+%% Grant configure and read but deny write: the shovel starts but must not
+%% forward a message.
+no_write_access_on_dest_queue(Config) ->
+    Src = ?config(srcq, Config),
+    Dest = ?config(destq, Config),
+    Param = ?config(param, Config),
+    RestrictedUser = <<"restricted_", Param/binary>>,
+    rabbit_ct_broker_helpers:add_user(Config, RestrictedUser, RestrictedUser),
+    rabbit_ct_broker_helpers:set_permissions(
+      Config, RestrictedUser, <<"/">>, <<".*">>, <<"^$">>, <<".*">>),
+    Uri = make_uri(Config, 0, RestrictedUser, RestrictedUser),
+    ExtraArgs = [{<<"src-uri">>, Uri}, {<<"dest-uri">>, [Uri]}],
+    ShovelArgs = ?config(shovel_args, Config) ++ ExtraArgs,
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, rabbit_runtime_parameters, set,
+           [<<"/">>, <<"shovel">>, Param, ShovelArgs, none]),
+    try
+        shovel_test_utils:await_shovel(Config, 0, Param),
+        with_amqp10_session(
+          Config,
+          fun (Sess) ->
+                  SrcAddress = rabbitmq_amqp_address:queue(Src),
+                  DestAddress = rabbitmq_amqp_address:queue(Dest),
+                  amqp10_publish(Sess, SrcAddress, <<"leak-attempt">>, 1),
+                  amqp10_expect_empty(Sess, DestAddress)
+          end)
+    after
+        rabbit_ct_broker_helpers:delete_user(Config, RestrictedUser)
+    end.
+
+write_access_on_default_exchange_only(Config) ->
+    Src = ?config(srcq, Config),
+    Dest = ?config(destq, Config),
+    Param = ?config(param, Config),
+    RestrictedUser = <<"restricted_", Param/binary>>,
+    rabbit_ct_broker_helpers:add_user(Config, RestrictedUser, RestrictedUser),
+    rabbit_ct_broker_helpers:set_permissions(
+      Config, RestrictedUser, <<"/">>, <<".*">>, <<"^amq\\.default$">>, <<".*">>),
+    Uri = make_uri(Config, 0, RestrictedUser, RestrictedUser),
+    ExtraArgs = [{<<"src-uri">>, Uri}, {<<"dest-uri">>, [Uri]}],
+    ShovelArgs = ?config(shovel_args, Config) ++ ExtraArgs,
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, rabbit_runtime_parameters, set,
+           [<<"/">>, <<"shovel">>, Param, ShovelArgs, none]),
+    try
+        shovel_test_utils:await_shovel(Config, 0, Param),
+        with_amqp10_session(
+          Config,
+          fun (Sess) ->
+                  SrcAddress = rabbitmq_amqp_address:queue(Src),
+                  DestAddress = rabbitmq_amqp_address:queue(Dest),
+                  amqp10_publish(Sess, SrcAddress, <<"hello">>, 1),
+                  _ = amqp10_expect_one(Sess, DestAddress)
+          end)
+    after
+        rabbit_ct_broker_helpers:delete_user(Config, RestrictedUser)
+    end.
+
 application_properties(Config) ->
     Src = ?config(srcq, Config),
     Dest = ?config(destq, Config),
@@ -698,6 +789,60 @@ consumer_tag(Config) ->
                                                     30_000)
                                 end
                         end).
+
+dest_rejects_quorum_source(Config) ->
+    Src = ?config(srcq, Config),
+    Dest = ?config(destq, Config),
+    DLQ = dlq(Src),
+    NumMsgs = 20,
+    with_amqp10_session(Config,
+      fun (Sess) ->
+              amqp10_declare_queue(Sess, DLQ, #{}),
+              amqp10_declare_queue(Sess, Src, #{<<"x-queue-type">> => {utf8, <<"quorum">>},
+                                                <<"x-delivery-limit">> => {ulong, 2},
+                                                <<"x-dead-letter-exchange">> => {utf8, <<>>},
+                                                <<"x-dead-letter-routing-key">> => {utf8, DLQ}}),
+              declare_full_queue(Sess, Dest),
+              set_param(Config, ?config(param, Config), ?config(shovel_args, Config)),
+              SrcAddress = rabbitmq_amqp_address:queue(Src),
+              amqp10_publish(Sess, SrcAddress, <<"m">>, NumMsgs),
+              Msgs = lists:reverse(
+                       amqp10_expect_count(Sess, rabbitmq_amqp_address:queue(DLQ), NumMsgs)),
+              ?assertEqual([<<"m", (integer_to_binary(I))/binary>> || I <- lists:seq(1, NumMsgs)],
+                           [amqp10_msg:body_bin(M) || M <- Msgs]),
+              [?assertMatch(#{<<"x-last-death-reason">> := <<"delivery_limit">>},
+                            amqp10_msg:message_annotations(M)) || M <- Msgs],
+              amqp10_expect_empty(Sess, SrcAddress)
+      end).
+
+dest_rejects_classic_source(Config) ->
+    Src = ?config(srcq, Config),
+    Dest = ?config(destq, Config),
+    Param = ?config(param, Config),
+    with_amqp10_session(Config,
+      fun (Sess) ->
+              amqp10_declare_queue(Sess, Src, #{<<"x-queue-type">> => {utf8, <<"classic">>}}),
+              declare_full_queue(Sess, Dest),
+              set_param(Config, Param, ?config(shovel_args, Config)),
+              SrcAddress = rabbitmq_amqp_address:queue(Src),
+              amqp10_publish(Sess, SrcAddress, <<"m">>, 1),
+              ?awaitMatch({_, dynamic, {running, _}, #{forwarded := N}, _} when N >= 3,
+                          shovel_status(Config, {<<"/">>, Param}),
+                          30_000),
+              clear_param(Config, Param),
+              [Msg] = amqp10_expect_count(Sess, SrcAddress, 1),
+              ?assertEqual(<<"m1">>, amqp10_msg:body_bin(Msg)),
+              #{delivery_count := DeliveryCount} = amqp10_msg:headers(Msg),
+              ?assert(DeliveryCount >= 2)
+      end).
+
+declare_full_queue(Sess, QName) ->
+    amqp10_declare_queue(Sess, QName, #{<<"x-queue-type">> => {utf8, <<"classic">>},
+                                        <<"x-max-length">> => {ulong, 0},
+                                        <<"x-overflow">> => {utf8, <<"reject-publish">>}}).
+
+dlq(Src) ->
+    <<Src/binary, "_dlq">>.
 
 %%----------------------------------------------------------------------------
 maybe_skip_local_protocol(Config) ->

@@ -15,6 +15,12 @@
 -include_lib("rabbit/include/rabbit_queue_type.hrl").
 -include("rabbit_shovel.hrl").
 
+%% Same size as the rabbit_channel permission cache.
+-define(MAX_PERMISSION_CACHE_SIZE, 12).
+%% A permission change does not reach a running shovel, so the cache
+%% expires on a timer.
+-define(PERMISSION_CACHE_TTL, 60000).
+
 -rabbit_boot_step({rabbit_global_local_shovel_counters,
                    [{description, "global local shovel counters"},
                     {mfa,         {?MODULE, boot_step,
@@ -56,7 +62,7 @@
          handle_source/2,
          handle_dest/2,
          ack/3,
-         nack/3,
+         nack/2,
          forward/3,
          status/1,
          pending_count/1
@@ -172,7 +178,7 @@ parse_source(Def) ->
                   uris => SrcURIs,
                   resource_decl => SrcDeclFun,
                   queue => Queue,
-                  delete_after => opt_b2a(DeleteAfter),
+                  delete_after => rabbit_shovel_util:parse_delete_after(DeleteAfter),
                   delete_after_duration => DeleteAfterDuration,
                   consumer_args => SrcCArgs,
                   consumer_name => SrcCTag
@@ -289,6 +295,7 @@ connect_dest(State = #{dest := Dest = #{resource_decl := {M, F, MFArgs},
           on_confirm ->
               State#{dest => Dest#{current => #{queue_states => QState,
                                                 delivery_id => 1,
+                                                user => User,
                                                 vhost => VHost},
                                    unconfirmed => rabbit_shovel_confirms:init(),
                                    rejected => [],
@@ -297,6 +304,7 @@ connect_dest(State = #{dest := Dest = #{resource_decl := {M, F, MFArgs},
                                    confirmed_count => 0}};
           _ ->
               State#{dest => Dest#{current => #{queue_states => QState,
+                                                user => User,
                                                 vhost => VHost},
                                    unconfirmed => rabbit_shovel_confirms:init(),
                                    confirmed => [],
@@ -316,9 +324,13 @@ init_source(State = #{source := #{queue_r := QName,
                                   consumer_args := Args,
                                   consumer_name := CTag0,
                                   current := #{queue_states := QState0,
+                                               user := User,
                                                vhost := VHost} = Current} = Src,
                       name := Name,
                       ack_mode := AckMode}) ->
+    %% The consume below bypasses rabbit_channel, so the read check that
+    %% basic.consume performs there has to happen here.
+    ok = check_resource_access(User, QName, read),
     Mode = {credited, ?INITIAL_DELIVERY_COUNT},
     MaxLinkCredit = max_link_credit(),
     CTag = case CTag0 of
@@ -386,6 +398,8 @@ init_dest(#{name := Name,
             dest := #{add_forward_headers := AFH} = Dst} = State) ->
     rabbit_global_counters:publisher_created(?PROTOCOL),
     _TRef = erlang:send_after(1000, self(), send_confirms_and_nacks),
+    %% N.B. the source is checked once, in `init_source/1`.
+    _ = erlang:send_after(?PERMISSION_CACHE_TTL, self(), clear_permission_cache),
     Alarms0 = rabbit_alarm:register(self(), {?MODULE, conserve_resources, []}),
     Alarms = sets:from_list(Alarms0),
     case AFH of
@@ -428,7 +442,7 @@ dest_endpoint(#{dest := #{queue := Queue}}) ->
     [{dest_queue, Queue}];
 dest_endpoint(_Config) ->
     [].
-      
+
 close_dest(_State) ->
     rabbit_global_counters:publisher_deleted(?PROTOCOL),
     ok.
@@ -517,6 +531,10 @@ handle_dest({{'DOWN', #resource{kind = queue,
         {eol, QState1, _QRef} ->
             State0#{dest => Dest#{current => Current#{queue_states => QState1}}}
     end;
+handle_dest(clear_permission_cache, State) ->
+    _TRef = erlang:send_after(?PERMISSION_CACHE_TTL, self(), clear_permission_cache),
+    erase(local_shovel_permission_cache),
+    State;
 handle_dest({conserve_resources, Alarm, Conserve}, #{dest := #{alarms := Alarms0} = Dest} = State0) ->
     Alarms = case Conserve of
                  true -> sets:add_element(Alarm, Alarms0);
@@ -533,11 +551,19 @@ handle_dest({conserve_resources, Alarm, Conserve}, #{dest := #{alarms := Alarms0
 handle_dest(_Msg, State) ->
     State.
 
-ack(DeliveryTag, Multiple, State) ->
-    maybe_grant_credit(settle(complete, DeliveryTag, Multiple, State)).
+ack(DeliveryTag, Multiple,
+    #{source := #{current := #{unacked_message_q := UAMQ0}}} = State) ->
+    {MsgIds, UAMQ} = collect_acks(UAMQ0, DeliveryTag, Multiple),
+    maybe_grant_credit(settle(complete, MsgIds, UAMQ, State)).
 
-nack(DeliveryTag, Multiple, State) ->
-    maybe_grant_credit(settle(requeue, DeliveryTag, Multiple, State)).
+nack(DeliveryTags,
+     #{source := #{current := #{unacked_message_q := UAMQ0}}} = State) ->
+    {MsgIds, UAMQ} = lists:foldl(
+                       fun(DeliveryTag, {Acc, Q0}) ->
+                               {Ids, Q} = collect_acks(Q0, DeliveryTag, false),
+                               {Ids ++ Acc, Q}
+                       end, {[], UAMQ0}, DeliveryTags),
+    maybe_grant_credit(settle({modify, true, false, #{}}, MsgIds, UAMQ, State)).
 
 forward(Tag, Msg, State) ->
     case is_blocked(State) of
@@ -818,6 +844,33 @@ check_queue(QName, _QArgs, VHost, User) ->
                               passive = true},
     decl_fun([Method], VHost, User).
 
+%% Checks the URI user, not the ?SHOVEL_USER identity that performs the
+%% consume and the delivery. The result is cached because the destination
+%% check runs for every forwarded message.
+check_resource_access(User = #user{username = Username}, Resource, Permission) ->
+    Cache = case get(local_shovel_permission_cache) of
+                undefined -> [];
+                C         -> C
+            end,
+    Key = {Resource, Permission},
+    case lists:member(Key, Cache) of
+        true ->
+            ok;
+        false ->
+            try
+                ok = rabbit_access_control:check_resource_access(
+                       User, Resource, Permission, #{}),
+                CacheTail = lists:sublist(Cache, ?MAX_PERMISSION_CACHE_SIZE - 1),
+                put(local_shovel_permission_cache, [Key | CacheTail]),
+                ok
+            catch
+                exit:#amqp_error{name = access_refused} ->
+                    ?LOG_ERROR("Local shovel user ~ts was refused ~ts access to ~ts",
+                               [Username, Permission, rabbit_misc:rs(Resource)]),
+                    exit({shutdown, {access_refused, Username}})
+            end
+    end.
+
 get_user_vhost_from_amqp_param(Uri) ->
     {ok, AmqpParam} = amqp_uri:parse(Uri),
     {Username, Password, VHost} =
@@ -852,13 +905,11 @@ get_user_vhost_from_amqp_param(Uri) ->
             exit({shutdown, {access_refused, Username}})
     end.
 
-settle(Op, DeliveryTag, Multiple,
+settle(Op, MsgIds, UAMQ,
        #{source := #{queue_r := QRef,
                      current := Current = #{consumer_tag := CTag,
-                                            unacked_message_q := UAMQ0,
                                             queue_states := QState0}
                     } = Src} = State0) ->
-    {MsgIds, UAMQ} = collect_acks(UAMQ0, DeliveryTag, Multiple),
     case rabbit_queue_type:settle(QRef, Op, CTag, lists:reverse(MsgIds), QState0) of
         {ok, QState1, Actions} ->
             messages_acknowledged(Op, QRef, QState1, MsgIds),
@@ -904,11 +955,16 @@ collect_acks(AcknowledgedAcc, RemainingAcc, UAMQ, DeliveryTag, Multiple) ->
            {AcknowledgedAcc, UAMQTail}
     end.
 
+%% In pass-through mode the destination exchange is only known per message,
+%% so the write check happens here rather than at connect time.
 route(_Msg, #{queue_r := QueueR,
-              queue := Queue}) when Queue =/= none ->
+              queue := Queue,
+              current := #{vhost := VHost, user := User}}) when Queue =/= none ->
+    ok = check_resource_access(User, rabbit_misc:r(VHost, exchange, <<>>), write),
     [QueueR];
-route(Msg, #{current := #{vhost := VHost}}) ->
+route(Msg, #{current := #{vhost := VHost, user := User}}) ->
     ExchangeName = rabbit_misc:r(VHost, exchange, mc:exchange(Msg)),
+    ok = check_resource_access(User, ExchangeName, write),
     Exchange = rabbit_exchange:lookup_or_die(ExchangeName),
     rabbit_exchange:route(Exchange, Msg, #{return_binding_keys => true}).
 
@@ -1024,41 +1080,39 @@ confirm(MsgSeqNos, QRef, State = #{dest := Dst = #{unconfirmed := UC}}) ->
     {ConfirmMXs, UC1} = rabbit_shovel_confirms:confirm(MsgSeqNos, QRef, UC),
     record_confirms(ConfirmMXs, State#{dest => Dst#{unconfirmed => UC1}}).
 
-send_nacks([], _, State) ->
+send_nacks([], State) ->
     State;
-send_nacks(Rs, Cs, State) ->
-    coalesce_and_send(Rs, Cs,
-                      fun(MsgSeqNo, Multiple, StateX) ->
-                              rabbit_shovel_behaviour:nack(MsgSeqNo, Multiple, StateX)
-                      end, State).
+send_nacks(Rs, State) ->
+    rabbit_shovel_behaviour:nack(Rs, State).
 
 send_confirms([], _, State) ->
     State;
-send_confirms([MsgSeqNo], _, State) ->
+send_confirms([{_MsgSeqNo, Tag}], _, State) ->
     rabbit_global_counters:messages_confirmed(?PROTOCOL, 1),
-    rabbit_shovel_behaviour:ack(MsgSeqNo, false, State);
+    rabbit_shovel_behaviour:ack(Tag, false, State);
 send_confirms(Cs, Rs, State) ->
     rabbit_global_counters:messages_confirmed(?PROTOCOL, length(Cs)),
-    coalesce_and_send(Cs, Rs,
-                      fun(MsgSeqNo, Multiple, StateX) ->
-                              rabbit_shovel_behaviour:ack(MsgSeqNo, Multiple, StateX)
-                      end, State).
+    coalesce_and_send(Cs, Rs, State).
 
-coalesce_and_send(MsgSeqNos, NegativeMsgSeqNos, MkMsgFun,
+%% Coalesces by sequence number because, unlike source tags, sequence
+%% numbers are comparable with the unconfirmed ones and never wrap around.
+coalesce_and_send(MXs, NegativeMsgSeqNos,
                   State = #{dest := #{unconfirmed := UC}}) ->
-    SMsgSeqNos = lists:usort(MsgSeqNos),
+    SMXs = lists:ukeysort(1, MXs),
     UnconfirmedCutoff = case rabbit_shovel_confirms:is_empty(UC) of
-                            true  -> lists:last(SMsgSeqNos) + 1;
+                            true  -> element(1, lists:last(SMXs)) + 1;
                             false -> rabbit_shovel_confirms:smallest(UC)
                         end,
     Cutoff = lists:min([UnconfirmedCutoff | NegativeMsgSeqNos]),
-    {Ms, Ss} = lists:splitwith(fun(X) -> X < Cutoff end, SMsgSeqNos),
+    {Ms, Ss} = lists:splitwith(fun({SeqNo, _}) -> SeqNo < Cutoff end, SMXs),
     State1 = case Ms of
                  [] -> State;
-                 _  -> MkMsgFun(lists:last(Ms), true, State)
+                 _  ->
+                     {_, LastTag} = lists:last(Ms),
+                     rabbit_shovel_behaviour:ack(LastTag, true, State)
              end,
-    lists:foldl(fun(SeqNo, S) ->
-                        MkMsgFun(SeqNo, false, S)
+    lists:foldl(fun({_, Tag}, S) ->
+                        rabbit_shovel_behaviour:ack(Tag, false, S)
                 end, State1, Ss).
 
 %% Todo remove XName from confirm/unconfirm as we don't need it for local
@@ -1068,16 +1122,14 @@ send_confirms_and_nacks(State = #{dest := #{confirmed := [],
 send_confirms_and_nacks(State = #{dest := Dst = #{confirmed := C,
                                                   rejected := R}}) ->
     Confirms = lists:append(C),
-    ConfirmTags = [Tag || {_, Tag} <- Confirms],
-    Rejects = lists:append(R),
+    Rejects = lists:keysort(1, lists:append(R)),
     RejectTags = [Tag || {_, Tag} <- Rejects],
     State1 = #{dest := Dst2}
-        = send_confirms(ConfirmTags,
-                        RejectTags,
+        = send_confirms(Confirms,
+                        [SeqNo || {SeqNo, _} <- Rejects],
                         State#{dest => Dst#{confirmed => [],
                                             confirmed_count => 0}}),
     send_nacks(RejectTags,
-               ConfirmTags,
                State1#{dest => Dst2#{rejected => [],
                                      rejected_count => 0}}).
 
@@ -1148,6 +1200,3 @@ forward_pending_delivery(State) ->
                     forward_pending_delivery(S2)
             end
     end.
-
-opt_b2a(B) when is_binary(B) -> list_to_atom(binary_to_list(B));
-opt_b2a(N)                   -> N.

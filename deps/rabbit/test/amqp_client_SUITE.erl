@@ -84,6 +84,8 @@ groups() ->
        link_target_classic_queue_deleted,
        link_target_quorum_queue_deleted,
        target_queues_deleted_accepted,
+       publish_to_deleted_queue_released,
+       publish_to_deleted_and_live_queue_accepted,
        events,
        sync_get_unsettled_classic_queue,
        sync_get_unsettled_quorum_queue,
@@ -147,6 +149,8 @@ groups() ->
        modified_classic_queue,
        modified_quorum_queue,
        modified_quorum_queue_delivery_time,
+       disposition_reversed_range_rejected,
+       session_flow_max_incoming_window,
        modified_dead_letter_headers_exchange,
        modified_dead_letter_history,
        dead_letter_headers_exchange,
@@ -844,6 +848,56 @@ modified_quorum_queue_delivery_time(Config) ->
     ok = amqp10_client:detach_link(Receiver),
     ?assertMatch({ok, #{message_count := 0}},
                  rabbitmq_amqp_client:delete_queue(LinkPair, QName)),
+    ok = close(Init).
+
+%% A reversed disposition range ends the session with amqp:invalid-field.
+disposition_reversed_range_rejected(Config) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    {Connection, Session, LinkPair} = init(Config),
+    {ok, #{type := <<"quorum">>}} = rabbitmq_amqp_client:declare_queue(
+                                      LinkPair, QName,
+                                      #{arguments => #{<<"x-queue-type">> => {utf8, <<"quorum">>}}}),
+    Address = rabbitmq_amqp_address:queue(QName),
+    {ok, Sender} = amqp10_client:attach_sender_link(Session, <<"sender">>, Address),
+    ok = wait_for_credit(Sender),
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"t1">>, <<"m1">>, true)),
+    ok = amqp10_client:detach_link(Sender),
+
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session, <<"receiver">>, Address, unsettled),
+    {ok, M1} = amqp10_client:get_msg(Receiver),
+    DeliveryId = amqp10_msg:delivery_id(M1),
+
+    %% first is after last.
+    ok = amqp10_client_session:disposition(
+           Receiver, DeliveryId + 1, DeliveryId, true, accepted),
+    receive
+        {amqp10_event,
+         {session, Session,
+          {ended, #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_INVALID_FIELD}}}} -> ok
+    after 30000 -> flush(missing_ended),
+                   ct:fail("did not receive expected error")
+    end,
+    ok = close_connection_sync(Connection).
+
+%% A session FLOW may advertise the largest uint as its incoming window.
+session_flow_max_incoming_window(Config) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    {_, Session, LinkPair} = Init = init(Config),
+    {ok, _} = rabbitmq_amqp_client:declare_queue(LinkPair, QName, #{}),
+    ok = amqp10_client_session:flow(Session, 16#ffffffff, never),
+    Address = rabbitmq_amqp_address:queue(QName),
+    {ok, Sender} = amqp10_client:attach_sender_link(Session, <<"sender">>, Address),
+    ok = wait_for_credit(Sender),
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"t1">>, <<"m1">>, false)),
+    ok = wait_for_accepted(<<"t1">>),
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session, <<"receiver">>, Address, settled),
+    {ok, Msg} = amqp10_client:get_msg(Receiver),
+    ?assertEqual([<<"m1">>], amqp10_msg:body(Msg)),
+    ok = amqp10_client:detach_link(Sender),
+    ok = amqp10_client:detach_link(Receiver),
+    {ok, _} = rabbitmq_amqp_client:delete_queue(LinkPair, QName),
     ok = close(Init).
 
 %% Test that a message can be routed based on the message-annotations
@@ -2185,6 +2239,73 @@ rabbit_queue_type_deliver_to_q1(Qs, Msg, Opts, QTypeState) ->
                       end, Qs),
     1 = length(Q1),
     meck:passthrough([Q1, Msg, Opts, QTypeState]).
+
+publish_to_deleted_queue_released(Config) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config),
+    #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QName,
+                                                                   durable = true}),
+    {ok, Connection} = amqp10_client:open_connection(connection_config(Config)),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, rabbitmq_amqp_address:queue(QName)),
+    ok = wait_for_credit(Sender),
+    [Target] = rpc(Config, rabbit_db_queue, get_targets,
+                   [[rabbit_misc:r(<<"/">>, queue, QName)]]),
+    #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    route_to_deleted_queue(Config, Target),
+    try
+        ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<1>>, <<"m">>, false)),
+        ok = wait_for_settlement(<<1>>, released)
+    after
+        ok = rpc(Config, meck, unload, [rabbit_db_queue])
+    end,
+    ok = rabbit_ct_client_helpers:close_connection_and_channel(Conn, Ch),
+    ok = end_session_sync(Session),
+    ok = close_connection_sync(Connection).
+
+publish_to_deleted_and_live_queue_accepted(Config) ->
+    XName = atom_to_binary(?FUNCTION_NAME),
+    DeletedQName = <<XName/binary, "_deleted">>,
+    LiveQName = <<XName/binary, "_live">>,
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config),
+    #'exchange.declare_ok'{} = amqp_channel:call(
+                                 Ch, #'exchange.declare'{exchange = XName,
+                                                         type = <<"fanout">>}),
+    [begin
+         #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = Q,
+                                                                        durable = true}),
+         #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{queue = Q,
+                                                                  exchange = XName})
+     end || Q <- [DeletedQName, LiveQName]],
+    {ok, Connection} = amqp10_client:open_connection(connection_config(Config)),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, rabbitmq_amqp_address:exchange(XName)),
+    ok = wait_for_credit(Sender),
+    [Target] = rpc(Config, rabbit_db_queue, get_targets,
+                   [[rabbit_misc:r(<<"/">>, queue, DeletedQName)]]),
+    #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = DeletedQName}),
+    route_to_deleted_queue(Config, Target),
+    try
+        ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<1>>, <<"m">>, false)),
+        ok = wait_for_accepted(<<1>>)
+    after
+        ok = rpc(Config, meck, unload, [rabbit_db_queue])
+    end,
+    #'queue.declare_ok'{message_count = 1} =
+        amqp_channel:call(Ch, #'queue.declare'{queue = LiveQName, passive = true}),
+    #'exchange.delete_ok'{} = amqp_channel:call(Ch, #'exchange.delete'{exchange = XName}),
+    ok = rabbit_ct_client_helpers:close_connection_and_channel(Conn, Ch),
+    ok = end_session_sync(Session),
+    ok = close_connection_sync(Connection).
+
+route_to_deleted_queue(Config, Target) ->
+    rabbit_ct_broker_helpers:setup_meck(Config, [?MODULE]),
+    ok = rpc(Config, meck, new, [rabbit_db_queue, [no_link, passthrough]]),
+    ok = rpc(Config, meck, expect,
+             [rabbit_db_queue, get_targets,
+              fun(QNames) -> meck:passthrough([QNames]) ++ [Target] end]).
 
 events(Config) ->
     ok = event_recorder:start(Config),
