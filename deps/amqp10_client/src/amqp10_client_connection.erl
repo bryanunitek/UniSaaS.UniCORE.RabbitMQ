@@ -69,7 +69,7 @@
       notify_when_closed => pid() | none,
       notify_with_performative => boolean(),
       %% incoming maximum frame size set by our client application
-      max_frame_size => pos_integer(), % TODO: constrain to large than 512
+      max_frame_size => pos_integer(),
       %% outgoing maximum frame size set by AMQP peer in OPEN performative
       outgoing_max_frame_size => pos_integer() | undefined,
       idle_time_out => milliseconds(),
@@ -100,6 +100,11 @@
 %% -------------------------------------------------------------------
 
 -spec open(connection_config()) -> supervisor:startchild_ret().
+open(#{max_frame_size := MaxFrameSize})
+  when not (is_integer(MaxFrameSize) andalso
+            MaxFrameSize >= ?MIN_MAX_FRAME_SIZE andalso
+            MaxFrameSize =< ?MAX_MAX_FRAME_SIZE) ->
+    {error, {invalid_max_frame_size, MaxFrameSize}};
 open(Config0) ->
     Config = maps:update_with(sasl, fun maybe_encrypt_sasl/1, Config0),
     %% Start the supervision tree dedicated to that connection. It
@@ -214,7 +219,9 @@ expecting_socket({call, From}, begin_session,
     %% isn't fully opened. Let's queue this request until the connection
     %% is ready.
     State1 = State#state{pending_session_reqs = [From | PendingSessionReqs]},
-    {keep_state, State1}.
+    {keep_state, State1};
+expecting_socket(_EvtType, {'EXIT', _, _} = Exit, State) ->
+    unexpected_during_handshake(expecting_socket, Exit, State).
 
 sasl_hdr_sent(_EvtType, {protocol_header_received, 3, 1, 0, 0}, State) ->
     {next_state, sasl_hdr_rcvds, State};
@@ -306,15 +313,22 @@ open_sent(_EvtType, #'v1_0.open'{max_frame_size = MaybeMaxFrameSize,
                        Bytes when is_integer(Bytes) ->
                            Bytes
                    end,
-    State1 = State#state{config = Config#{outgoing_max_frame_size => MaxFrameSize}},
-    State2 = lists:foldr(
-               fun(From, S0) ->
-                       {Ret, S2} = handle_begin_session(From, S0),
-                       _ = gen_statem:reply(From, Ret),
-                       S2
-               end, State1, PendingSessionReqs),
-    ok = notify_opened(Config, Open),
-    {next_state, opened, State2#state{pending_session_reqs = []}};
+    case MaxFrameSize >= ?MIN_MAX_FRAME_SIZE of
+        true ->
+            State1 = State#state{config = Config#{outgoing_max_frame_size => MaxFrameSize}},
+            State2 = lists:foldr(
+                       fun(From, S0) ->
+                               {Ret, S2} = handle_begin_session(From, S0),
+                               _ = gen_statem:reply(From, Ret),
+                               S2
+                       end, State1, PendingSessionReqs),
+            ok = notify_opened(Config, Open),
+            {next_state, opened, State2#state{pending_session_reqs = []}};
+        false ->
+            [gen_statem:reply(From, {error, closed}) || From <- PendingSessionReqs],
+            _ = send_close(State, none),
+            {stop, {shutdown, {invalid_peer_max_frame_size, MaxFrameSize}}, State}
+    end;
 open_sent({call, From}, begin_session,
           #state{pending_session_reqs = PendingSessionReqs} = State) ->
     State1 = State#state{pending_session_reqs = [From | PendingSessionReqs]},
@@ -345,7 +359,9 @@ open_sent(_EvtType, #'v1_0.close'{} = Close,
     {stop, normal, State};
 open_sent(info, {'DOWN', MRef, process, _, _},
           #state{reader_m_ref = MRef}) ->
-    {stop, {shutdown, reader_down}}.
+    {stop, {shutdown, reader_down}};
+open_sent(_EvtType, {'EXIT', _, _} = Exit, State) ->
+    unexpected_during_handshake(open_sent, Exit, State).
 
 opened(_EvtType, heartbeat, State = #state{idle_time_out = T}) ->
     ok = send_heartbeat(State),
@@ -431,6 +447,9 @@ close_sent(_EvtType, #'v1_0.open'{}, _Data) ->
 %% A peer that refuses the connection or misbehaves can send frames out
 %% of the expected handshake sequence. Terminating with a stack trace
 %% would help nobody; log the frame and stop quietly instead.
+unexpected_during_handshake(_StateName, {'EXIT', _Pid, _Reason}, State) ->
+    %% The process that opened this connection is gone.
+    {stop, {shutdown, owner_down}, State};
 unexpected_during_handshake(StateName, Frame, State) ->
     ?LOG_WARNING("Connection ~tp received an unexpected frame or message "
                  "~tp during handshake (~ts)",
@@ -455,23 +474,13 @@ terminate(Reason, _StateName, #state{connection_sup = Sup,
                                    {shutdown, R} -> R;
                                    _             -> Reason
                                end),
-    case Reason of
-        normal ->
-            %% Tear down the rest of the connection's supervision tree
-            %% (reader, sessions) now that we're done: a quiet (`normal')
-            %% child termination is not cascaded to `one_for_all' siblings.
-            %%
-            %% This must not be a blocking call: `Sup' shutting down this
-            %% very process is part of its own termination, which can
-            %% never complete while we are still executing this callback,
-            %% so calling sys:terminate/2 (or supervisor:terminate_child/2)
-            %% directly here would deadlock both processes until they each
-            %% hit their 5-second timeout.
-            _ = spawn(fun() -> sys:terminate(Sup, normal) end),
-            ok;
-        _ ->
-            ok
-    end.
+    %% A `normal' or `{shutdown, _}' exit is not cascaded to `one_for_all'
+    %% siblings, so stop the reader and the sessions supervisor explicitly.
+    %%
+    %% This call must not block: `Sup' cannot stop this process until
+    %% `terminate/3' returns, so a direct `sys:terminate/2' would deadlock.
+    _ = spawn(fun() -> sys:terminate(Sup, normal) end),
+    ok.
 
 code_change(_OldVsn, StateName, State, _Extra) ->
     {ok, StateName, State}.
@@ -699,5 +708,30 @@ decrypted_sasl_to_mechanism({plain, _, _}) ->
 config_defaults() ->
     #{sasl => none,
       transfer_limit_margin => 0,
-      %% 1 MB
-      max_frame_size => 1_048_576}.
+      max_frame_size => ?DEFAULT_MAX_FRAME_SIZE}.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+open_sent_peer_max_frame_size_below_minimum_test_() ->
+    {ok, LSock} = gen_tcp:listen(0, [binary]),
+    {ok, Port} = inet:port(LSock),
+    {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary]),
+    State = #state{connection_sup = self(),
+                   socket = {tcp, Sock},
+                   config = #{}},
+    Result = [open_sent(info,
+                        #'v1_0.open'{max_frame_size = {uint, Size}},
+                        State)
+              || Size <- [0, 8, ?MIN_MAX_FRAME_SIZE - 1]],
+    ok = gen_tcp:close(Sock),
+    ok = gen_tcp:close(LSock),
+    [?_assertMatch({stop, {shutdown, {invalid_peer_max_frame_size, Size}}, _},
+                   R)
+     || {Size, R} <- lists:zip([0, 8, ?MIN_MAX_FRAME_SIZE - 1], Result)].
+
+open_invalid_max_frame_size_test_() ->
+    [?_assertEqual({error, {invalid_max_frame_size, Size}},
+                   open(#{max_frame_size => Size}))
+     || Size <- [511, 0, -1, 16_777_217, 4_294_967_295, infinity, <<"1024">>]].
+-endif.

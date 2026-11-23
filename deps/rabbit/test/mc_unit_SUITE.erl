@@ -30,6 +30,7 @@ all_tests() ->
      amqpl_defaults,
      amqpl_compat,
      amqpl_table_x_header,
+     amqpl_stream_filter_value,
      amqpl_table_x_header_array_of_tbls,
      amqpl_death_records,
      is_death_cycle,
@@ -60,6 +61,8 @@ all_tests() ->
      amqp_amqpl_binary_map_key_dropped,
      amqp_amqpl_ulong_in_list_converted,
      amqp_amqpl_x_cc_unconvertible_value_dropped,
+     amqp_null_and_described_annotations,
+     amqpl_amqp_decimal,
      mc_amqpl_is_convertible,
      mc_amqpl_is_representable,
      mc_amqpl_is_representable_nested,
@@ -73,6 +76,21 @@ all_tests() ->
 %%%===================================================================
 %%% Test cases
 %%%===================================================================
+
+amqpl_stream_filter_value(_Config) ->
+    StreamMessage = fun(Headers) ->
+                            Content = #content{properties = #'P_basic'{headers = Headers},
+                                               payload_fragments_rev = [<<"data">>]},
+                            rabbit_stream_queue:stream_message(
+                              mc:init(mc_amqpl, Content, annotations()))
+                    end,
+    ?assertMatch({<<"apple">>, _},
+                 StreamMessage([{<<"x-stream-filter-value">>, longstr, <<"apple">>}])),
+    ?assertNotMatch({_, _},
+                    StreamMessage([{<<"x-stream-filter-value">>, long, 42}])),
+    ?assertNotMatch({_, _},
+                    StreamMessage([{<<"x-stream-filter-value">>, bool, true}])),
+    ok.
 
 amqpl_defaults(_Config) ->
     Props = #'P_basic'{},
@@ -827,6 +845,62 @@ amqp_amqpl_x_cc_unconvertible_value_dropped(_Config) ->
     ?assertMatch({_, longstr, <<"still-here">>}, header(<<"x-other">>, HL)),
     ok.
 
+amqp_null_and_described_annotations(_Config) ->
+    Described = {described, {ulong, 16#77}, {utf8, <<"v">>}},
+    MAC = [{{symbol, <<"x-null">>}, null},
+           {{symbol, <<"x-described">>}, Described},
+           {{symbol, <<"x-other">>}, {utf8, <<"still-here">>}}],
+    M = #'v1_0.message_annotations'{content = MAC},
+    D = #'v1_0.data'{content = <<"data">>},
+    Payload = serialize_sections([M, D]),
+
+    Msg = mc:init(mc_amqp, Payload, annotations()),
+    Sections = amqp10_framing:decode_bin(
+                 iolist_to_binary(mc:protocol_state(Msg))),
+    [#'v1_0.message_annotations'{content = MAC1}] =
+        [S || #'v1_0.message_annotations'{} = S <- Sections],
+    ?assertEqual(null, amqp_map_get({symbol, <<"x-null">>}, MAC1)),
+    ?assertEqual(Described, amqp_map_get({symbol, <<"x-described">>}, MAC1)),
+    ?assertEqual({utf8, <<"still-here">>},
+                 amqp_map_get({symbol, <<"x-other">>}, MAC1)),
+
+    MsgL = mc:convert(mc_amqpl, Msg),
+    #content{properties = #'P_basic'{headers = HL}} = mc:protocol_state(MsgL),
+    ?assertMatch({_, void, undefined}, header(<<"x-null">>, HL)),
+    ?assertEqual(undefined, header(<<"x-described">>, HL)),
+    ?assertMatch({_, longstr, <<"still-here">>}, header(<<"x-other">>, HL)),
+    ok.
+
+amqpl_amqp_decimal(_Config) ->
+    Headers = [{<<"d1">>, decimal, {2, 12345}},
+               {<<"x-d">>, decimal, {2, 1}},
+               {<<"x-table">>, table, [{<<"d">>, decimal, {1, 10}},
+                                       {<<"s">>, longstr, <<"ok">>}]},
+               {<<"x-array">>, array, [{decimal, {1, 1}}, {longstr, <<"ok">>}]},
+               {<<"a-string">>, longstr, <<"ok">>}],
+    Props = #'P_basic'{headers = Headers},
+    Content = #content{properties = Props,
+                       payload_fragments_rev = [<<"data">>]},
+    Msg = mc:init(mc_amqpl, Content, annotations()),
+    ?assertEqual(undefined, mc:x_header(<<"x-d">>, Msg)),
+    ?assertNot(maps:is_key(<<"x-d">>, mc:x_headers(Msg))),
+
+    Msg10 = mc:convert(mc_amqp, Msg),
+    Sections = amqp10_framing:decode_bin(
+                 iolist_to_binary(mc:protocol_state(Msg10))),
+    [#'v1_0.application_properties'{content = AP}] =
+        [S || #'v1_0.application_properties'{} = S <- Sections],
+    [#'v1_0.message_annotations'{content = MA}] =
+        [S || #'v1_0.message_annotations'{} = S <- Sections],
+    ?assertEqual(undefined, amqp_map_get(utf8(<<"d1">>), AP)),
+    ?assertEqual({utf8, <<"ok">>}, amqp_map_get(utf8(<<"a-string">>), AP)),
+    ?assertEqual(undefined, amqp_map_get({symbol, <<"x-d">>}, MA)),
+    ?assertEqual({map, [{{symbol, <<"s">>}, {utf8, <<"ok">>}}]},
+                 amqp_map_get({symbol, <<"x-table">>}, MA)),
+    ?assertEqual({list, [{utf8, <<"ok">>}]},
+                 amqp_map_get({symbol, <<"x-array">>}, MA)),
+    ok.
+
 mc_amqpl_is_convertible(_Config) ->
     ?assertNot(mc_amqpl:is_convertible({as_is, 16#74, <<0,0,0,0>>})),
     ?assertNot(mc_amqpl:is_convertible({char, 65})),
@@ -1247,11 +1321,22 @@ amqp_x_headers(_Config) ->
     Payload = serialize_sections([M, A, D]),
     Msg0 = mc:init(mc_amqp, Payload, annotations()),
     Msg1 = mc:set_annotation(<<"x-1">>, {byte, -2}, Msg0),
-    ?assertEqual(#{<<"x-1">> => {byte, -2},
-                   <<"x-list">> => {list,[{utf8,<<"l">>}]},
-                   <<"x-map">> => {map,[{{utf8,<<"k">>},{utf8,<<"v">>}}]},
-                   <<"x-stream-filter">> => {utf8,<<"apple">>}},
-                 mc:x_headers(Msg1)).
+    Msg2 = mc:set_annotation(<<"x-2">>, 1.5, Msg1),
+    Msg = mc:set_annotation(<<"x-3">>, null, Msg2),
+    XHeaders = #{<<"x-1">> => {byte, -2},
+                 <<"x-2">> => {double, 1.5},
+                 <<"x-3">> => null,
+                 <<"x-list">> => {list,[{utf8,<<"l">>}]},
+                 <<"x-map">> => {map,[{{utf8,<<"k">>},{utf8,<<"v">>}}]},
+                 <<"x-stream-filter">> => {utf8,<<"apple">>}},
+    ?assertEqual(XHeaders, mc:x_headers(Msg)),
+    ?assertEqual({double, 1.5}, mc:x_header(<<"x-2">>, Msg)),
+    ?assertEqual(null, mc:x_header(<<"x-3">>, Msg)),
+
+    Msg10 = mc_amqp:init_from_stream(iolist_to_binary(mc:protocol_state(Msg)), #{}),
+    ?assertEqual(XHeaders#{<<"x-exchange">> => {utf8, <<"exch">>},
+                           <<"x-routing-key">> => {utf8, <<"apple">>}},
+                 mc:x_headers(Msg10)).
 
 amqpl_x_headers(_Config) ->
     Props = #'P_basic'{headers = [{<<"a-string">>, longstr, <<"a string">>},

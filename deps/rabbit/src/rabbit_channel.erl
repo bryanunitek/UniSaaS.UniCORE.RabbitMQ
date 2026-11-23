@@ -186,6 +186,8 @@
 
 -define(CONSUMER_CANCEL_OK_TIMEOUT, 10_000).
 
+-define(CLOSE_OK_TIMEOUT, 5_000).
+
 -define(STATISTICS_KEYS,
         [reductions,
          pid,
@@ -604,7 +606,8 @@ handle_cast(ready_for_close,
             State = #ch{cfg = #conf{state = closing,
                                     writer_pid = WriterPid}}) ->
     try
-        ok = rabbit_writer:send_command_sync(WriterPid, #'channel.close_ok'{})
+        ok = rabbit_writer:send_command_sync_timeout(
+               WriterPid, #'channel.close_ok'{}, ?CLOSE_OK_TIMEOUT)
     catch
         _Class:Reason ->
             ?LOG_DEBUG("Failed to send 'channel.close_ok' on a terminating connection, reason: ~tp", [Reason])
@@ -939,6 +942,19 @@ check_write_permitted_on_topics(#exchange{type = topic} = Resource, User, Mc, Au
 check_write_permitted_on_topics(_, _, _, _) ->
     ok.
 
+check_dead_letter_routing_key(DLX, Args, User, AuthzContext) ->
+    case rabbit_misc:table_lookup(Args, <<"x-dead-letter-routing-key">>) of
+        {longstr, RoutingKey} ->
+            case rabbit_exchange:lookup(DLX) of
+                {ok, X} ->
+                    check_topic_authorisation(X, User, RoutingKey, AuthzContext, write);
+                {error, not_found} ->
+                    ok
+            end;
+        _ ->
+            ok
+    end.
+
 check_read_permitted_on_topic(Resource, User, RoutingKey, AuthzContext) ->
     check_topic_authorisation(Resource, User, RoutingKey, AuthzContext, read).
 
@@ -956,6 +972,19 @@ check_expiration_header(Props) ->
         {error, E} -> rabbit_misc:precondition_failed("invalid expiration '~ts': ~tp",
                                                       [Props#'P_basic'.expiration, E])
     end.
+
+check_routing_headers(#'P_basic'{headers = Headers}) ->
+    lists:foreach(
+      fun(Key) ->
+              case rabbit_basic:header(Key, Headers) of
+                  {_, array, Routes} when length(Routes) > ?MAX_ROUTING_HEADER_ENTRIES ->
+                      rabbit_misc:precondition_failed(
+                        "header '~ts' has ~b entries, the limit is ~b",
+                        [Key, length(Routes), ?MAX_ROUTING_HEADER_ENTRIES]);
+                  _ ->
+                      ok
+              end
+      end, ?ROUTING_HEADERS).
 
 check_internal_exchange(#exchange{name = Name, internal = true}) ->
     rabbit_misc:protocol_error(access_refused,
@@ -1240,6 +1269,7 @@ handle_method(#'basic.publish'{exchange    = ExchangeNameBin,
     DecContent0 = rabbit_binary_parser:ensure_content_decoded(Content),
     DecContent = #content{properties = Props} = override_reply_to(DecContent0, State1),
     check_expiration_header(Props),
+    check_routing_headers(Props),
     DoConfirm = Tx =/= none orelse ConfirmEnabled,
     {DeliveryOptions, State} =
         case DoConfirm of
@@ -2573,7 +2603,7 @@ handle_method(#'queue.declare'{queue       = QueueNameBin,
                DLX ->
                    check_read_permitted(QueueName, User, AuthzContext),
                    check_write_permitted(DLX, User, AuthzContext),
-                   ok
+                   check_dead_letter_routing_key(DLX, Args, User, AuthzContext)
             end,
             case rabbit_amqqueue:declare(QueueName, Durable, AutoDelete,
                                          Args, Owner, Username) of

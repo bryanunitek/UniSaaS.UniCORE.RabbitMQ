@@ -8,7 +8,8 @@
 
 -import(rabbit_amqp_session,
         [check_resource_access/4,
-         check_read_permitted_on_topic/4]).
+         check_read_permitted_on_topic/4,
+         check_write_permitted_on_topics/4]).
 -import(rabbit_misc,
         [queue_resource/2,
          exchange_resource/2]).
@@ -17,6 +18,7 @@
 -export([check_routing_arg/5,
          check_alternate_exchange/4,
          check_dead_letter_exchange/4,
+         check_dead_letter_routing_key/4,
          handle_http_req/8,
          args_amqp_to_amqpl/1,
          decode_queue/1,
@@ -30,6 +32,7 @@
                               rabbit_amqp_session:topic_permission_cache()}.
 
 -define(DEAD_LETTER_EXCHANGE_KEY, <<"x-dead-letter-exchange">>).
+-define(DEAD_LETTER_ROUTING_KEY_KEY, <<"x-dead-letter-routing-key">>).
 -define(ALTERNATE_EXCHANGE_KEY, <<"alternate-exchange">>).
 
 -spec handle_request(binary(),
@@ -162,16 +165,18 @@ handle_http_req(HttpMethod = <<"PUT">>,
                            {ok, {<<"200">>, RespPayload, {PermCache1, TopicPermCache}}}
                    catch exit:#amqp_error{name = precondition_failed,
                                           explanation = Expl} ->
-                             throw(<<"409">>, Expl, []);
+                             throw(<<"409">>, "~ts", [Expl]);
                          exit:#amqp_error{explanation = Expl} ->
-                             throw(<<"400">>, Expl, [])
+                             throw(<<"400">>, "~ts", [Expl])
                    end
            end) of
         {ok, Result} ->
             Result;
         {error, not_found} ->
             PermCache = check_dead_letter_exchange(QName, QArgs, User, PermCache1),
-            PermCaches = {PermCache, TopicPermCache},
+            TopicPermCache1 = check_dead_letter_routing_key(
+                                QName, QArgs, User, TopicPermCache),
+            PermCaches = {PermCache, TopicPermCache1},
             try rabbit_amqqueue:declare(
                   QName, Durable, AutoDelete, QArgs, Owner, Username) of
                 {new, Q} ->
@@ -198,9 +203,9 @@ handle_http_req(HttpMethod = <<"PUT">>,
                     throw(<<"400">>, Reason, ReasonArgs)
             catch exit:#amqp_error{name = precondition_failed,
                                    explanation = Expl} ->
-                      throw(<<"409">>, Expl, []);
+                      throw(<<"409">>, "~ts", [Expl]);
                   exit:#amqp_error{explanation = Expl} ->
-                      throw(<<"400">>, Expl, [])
+                      throw(<<"400">>, "~ts", [Expl])
             end;
         {error, {absent, Q, Reason}} ->
             absent(Q, Reason)
@@ -223,7 +228,7 @@ handle_http_req(<<"PUT">>,
      } = decode_exchange(ReqPayload),
     XTypeAtom = try rabbit_exchange:check_type(XTypeBin)
                 catch exit:#amqp_error{explanation = Explanation} ->
-                          throw(<<"400">>, Explanation, [])
+                          throw(<<"400">>, "~ts", [Explanation])
                 end,
     XName = exchange_resource(Vhost, XNameBin),
     ok = prohibit_default_exchange(XName),
@@ -255,7 +260,7 @@ handle_http_req(<<"PUT">>,
             {<<"204">>, null, {PermCache, TopicPermCache}}
     catch exit:#amqp_error{name = precondition_failed,
                            explanation = Expl} ->
-              throw(<<"409">>, Expl, [])
+              throw(<<"409">>, "~ts", [Expl])
     end;
 
 handle_http_req(<<"DELETE">>,
@@ -283,9 +288,9 @@ handle_http_req(<<"DELETE">>,
                   end
           end)
     catch exit:#amqp_error{name = not_found, explanation = Explanation} ->
-              throw(<<"404">>, Explanation, []);
+              throw(<<"404">>, "~ts", [Explanation]);
           exit:#amqp_error{explanation = Explanation} ->
-              throw(<<"400">>, Explanation, [])
+              throw(<<"400">>, "~ts", [Explanation])
     end;
 
 handle_http_req(<<"DELETE">>,
@@ -305,7 +310,7 @@ handle_http_req(<<"DELETE">>,
             RespPayload = purge_or_delete_queue_response(NumMsgs),
             {<<"200">>, RespPayload, {PermCache, TopicPermCache}}
     catch exit:#amqp_error{explanation = Explanation} ->
-              throw(<<"400">>, Explanation, [])
+              throw(<<"400">>, "~ts", [Explanation])
     end;
 
 handle_http_req(<<"DELETE">>,
@@ -402,7 +407,7 @@ handle_http_req(<<"GET">>,
                        _ ->
                            throw(<<"400">>,
                                  "missing 'dste' or 'dstq' in query: ~tP",
-                                 [QueryMap, 10])
+                                 [QueryMap, ?FORMAT_DEPTH_LIMIT])
                    end,
     SrcXName = exchange_resource(Vhost, SrcXNameBin),
     DstName = rabbit_misc:r(Vhost, DstKind, DstNameBin),
@@ -438,7 +443,7 @@ decode_queue({map, KVList}) ->
              ({{utf8, <<"arguments">>}, Args}, Acc) ->
                   Acc#{arguments => args_amqp_to_amqpl(Args)};
              (Prop, _Acc) ->
-                  throw(<<"400">>, "bad queue property ~tP", [Prop, 10])
+                  throw(<<"400">>, "bad queue property ~tP", [Prop, ?FORMAT_DEPTH_LIMIT])
           end, #{}, KVList),
     Defaults = #{durable => true,
                  exclusive => false,
@@ -510,7 +515,7 @@ decode_exchange({map, KVList}) ->
              ({{utf8, <<"arguments">>}, Args}, Acc) ->
                   Acc#{arguments => args_amqp_to_amqpl(Args)};
              (Prop, _Acc) ->
-                  throw(<<"400">>, "bad exchange property ~tP", [Prop, 10])
+                  throw(<<"400">>, "bad exchange property ~tP", [Prop, ?FORMAT_DEPTH_LIMIT])
           end, #{}, KVList),
     Defaults = #{durable => true,
                  auto_delete => false,
@@ -532,7 +537,7 @@ decode_binding({map, KVList}) ->
          ({{utf8, <<"arguments">>}, Args}, Acc) ->
               Acc#{arguments => args_amqp_to_amqpl(Args)};
          (Field, _Acc) ->
-              throw(<<"400">>, "bad binding field ~tP", [Field, 10])
+              throw(<<"400">>, "bad binding field ~tP", [Field, ?FORMAT_DEPTH_LIMIT])
       end, #{}, KVList).
 
 encode_bindings(Bindings) ->
@@ -569,12 +574,12 @@ args_amqp_to_amqpl({map, KVList}) ->
                           false ->
                               throw(<<"400">>,
                                     "unsupported argument name or value ~tP",
-                                    [{{T, Key}, TypeVal}, 10])
+                                    [{{T, Key}, TypeVal}, ?FORMAT_DEPTH_LIMIT])
                       end;
                  (Arg) ->
                       throw(<<"400">>,
                             "unsupported argument ~tP",
-                            [Arg, 10])
+                            [Arg, ?FORMAT_DEPTH_LIMIT])
               end, KVList).
 
 args_amqpl_to_amqp(Args) ->
@@ -602,7 +607,7 @@ parse_uri(Uri) ->
                                    {error, Atom, Term} ->
                                        throw(<<"400">>,
                                              "failed to dissect query '~ts': ~s ~tP",
-                                             [truncate_for_error(Query), Atom, Term, 10])
+                                             [truncate_for_error(Query), Atom, Term, ?FORMAT_DEPTH_LIMIT])
                                end;
                            error ->
                                #{}
@@ -611,7 +616,7 @@ parse_uri(Uri) ->
         {error, Atom, Term} ->
             throw(<<"400">>,
                   "failed to normalize URI '~ts': ~s ~tP",
-                  [truncate_for_error(Uri), Atom, Term, 10])
+                  [truncate_for_error(Uri), Atom, Term, ?FORMAT_DEPTH_LIMIT])
     end.
 
 compose_binding_uri(Src, DstKind, Dst, Key, Args) ->
@@ -702,7 +707,7 @@ binding_checks(SrcXName, DstName, BindingKey, User, {PermCache0, TopicPermCache0
 binding_action(Action, Binding, Username, ConnPid) ->
     try rabbit_channel:binding_action(Action, Binding, Username, ConnPid)
     catch exit:#amqp_error{explanation = Explanation} ->
-              throw(<<"400">>, Explanation, [])
+              throw(<<"400">>, "~ts", [Explanation])
     end.
 
 purge_or_delete_queue_response(NumMsgs) ->
@@ -757,6 +762,20 @@ prohibit_reserved_amq(#resource{}) ->
 check_dead_letter_exchange(QName, QArgs, User, PermCache) ->
     check_routing_arg(QName, QArgs, ?DEAD_LETTER_EXCHANGE_KEY, User, PermCache).
 
+check_dead_letter_routing_key(#resource{virtual_host = Vhost}, QArgs, User, TopicPermCache) ->
+    case {rabbit_misc:r_arg(Vhost, exchange, QArgs, ?DEAD_LETTER_EXCHANGE_KEY),
+          rabbit_misc:table_lookup(QArgs, ?DEAD_LETTER_ROUTING_KEY_KEY)} of
+        {#resource{} = DLX, {longstr, RoutingKey}} ->
+            case rabbit_exchange:lookup(DLX) of
+                {ok, X} ->
+                    check_write_permitted_on_topics(X, User, [RoutingKey], TopicPermCache);
+                {error, not_found} ->
+                    TopicPermCache
+            end;
+        _ ->
+            TopicPermCache
+    end.
+
 check_alternate_exchange(XName, XArgs, User, PermCache) ->
     check_routing_arg(XName, XArgs, ?ALTERNATE_EXCHANGE_KEY, User, PermCache).
 
@@ -781,7 +800,7 @@ absent(Queue, Reason) ->
     Explanation = try rabbit_amqqueue:absent(Queue, Reason)
                   catch exit:#amqp_error{explanation = E} -> E
                   end,
-    throw(<<"400">>, Explanation, []).
+    throw(<<"400">>, "~ts", [Explanation]).
 
 -spec throw(binary(), io:format(), [term()]) -> no_return().
 throw(StatusCode, Format, Data) ->

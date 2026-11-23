@@ -39,8 +39,11 @@ all() -> [
     validate_max_hops_accepts_bounds,
     validate_max_hops_rejects_out_of_range,
     validate_max_hops_rejects_non_integers,
+    validate_reconnect_delay_accepts_non_negative_numbers,
+    validate_reconnect_delay_rejects_invalid_values,
     max_hops_keeps_valid_values,
-    max_hops_normalizes_legacy_values
+    max_hops_normalizes_legacy_values,
+    dropped_message_needs_ack_per_ack_mode
 ].
 
 init_per_suite(Config) ->
@@ -206,7 +209,7 @@ to_params_returns_error_on_unparseable_uri(_Config) ->
                16#E2, 16#80, 16#A8, "connect">>,
     Upstream = #upstream{uris = [BadURI], name = <<"u">>},
     XorQ = #resource{virtual_host = <<"/">>, kind = exchange, name = <<"x">>},
-    ?assertMatch({error, {{unknown_mechanism, _}, _SafeURI}},
+    ?assertMatch({error, {unknown_mechanism, _SafeURI}},
                  rabbit_federation_upstream:to_params(Upstream, XorQ)),
     ok.
 
@@ -222,9 +225,7 @@ to_params_error_strips_credentials(_Config) ->
     ?assertEqual(nomatch, binary:match(SafeURI, <<"alice">>)),
     ok.
 
-%% A structurally malformed URI must not crash `to_params/2`. Such URIs also
-%% crash `amqp_uri:remove_credentials/1`, so the error branch has to strip
-%% credentials without relying on it.
+%% A structurally malformed URI must not crash `to_params/2`.
 to_params_error_on_malformed_uri_strips_credentials(_Config) ->
     BadURI = <<"amqp://alice:s3cret@:::">>,
     Upstream = #upstream{uris = [BadURI], name = <<"u">>},
@@ -233,8 +234,6 @@ to_params_error_on_malformed_uri_strips_credentials(_Config) ->
         rabbit_federation_upstream:to_params(Upstream, XorQ),
     ?assertEqual(nomatch, binary:match(SafeURI, <<"s3cret">>)),
     ?assertEqual(nomatch, binary:match(SafeURI, <<"alice">>)),
-    %% The parse-error `Info` for a malformed URI embeds the raw URI, so it
-    %% must be sanitized as well or the credentials leak into the logs.
     ?assertEqual(nomatch, binary:match(iolist_to_binary(io_lib:format("~tp", [Info])),
                                        <<"s3cret">>)),
     ?assertEqual(nomatch, binary:match(iolist_to_binary(io_lib:format("~tp", [Info])),
@@ -259,8 +258,6 @@ to_params_falls_back_to_valid_uri(_Config) ->
       [[BadURI, GoodURI], [GoodURI, BadURI]]),
     ok.
 
-%% Some `amqp_uri:parse/2` error shapes embed the full query string, which can
-%% carry a TLS `password` or other secret. The error tuple must not leak it.
 to_params_error_redacts_query_secrets(_Config) ->
     BadURI = <<"amqps://guest:guest@localhost/?depth=notanumber&password=s3cret">>,
     Upstream = #upstream{uris = [BadURI], name = <<"u">>},
@@ -342,11 +339,28 @@ max_hops_normalizes_legacy_values(_Config) ->
     ?assertEqual(0, rabbit_federation_upstream:max_hops(<<"many">>)),
     ok.
 
+validate_reconnect_delay_accepts_non_negative_numbers(_Config) ->
+    [?assertEqual([], validation_errors(<<"reconnect-delay">>, V)) || V <- [0, 0.5, 1, 30]],
+    ok.
+
+validate_reconnect_delay_rejects_invalid_values(_Config) ->
+    [?assertMatch([{error, _, _}], validation_errors(<<"reconnect-delay">>, V)) ||
+        V <- [-1, -0.5, <<"1">>]],
+    ok.
+
 %% Goes through the upstream set component because, unlike the upstream one,
 %% it has no mandatory URI to validate.
 validation_errors(MaxHops) ->
+    validation_errors(<<"max-hops">>, MaxHops).
+
+validation_errors(Key, Value) ->
     Results = rabbit_federation_parameters:validate(
                 <<"/">>, <<"federation-upstream-set">>,
                 <<"a-name">>, [[{<<"upstream">>, <<"an-upstream">>},
-                                {<<"max-hops">>, MaxHops}]], none),
+                                {Key, Value}]], none),
     [R || Rs <- Results, R <- Rs, R =/= ok].
+
+dropped_message_needs_ack_per_ack_mode(_Config) ->
+    ?assert(rabbit_federation_link_util:dropped_message_needs_ack('on-confirm')),
+    ?assert(rabbit_federation_link_util:dropped_message_needs_ack('on-publish')),
+    ?assertNot(rabbit_federation_link_util:dropped_message_needs_ack('no-ack')).

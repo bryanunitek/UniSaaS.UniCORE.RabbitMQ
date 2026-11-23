@@ -13,10 +13,10 @@ jobs:
   update-versions:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-tags: true
-      - uses: carvel-dev/setup-action@47ccf1e203f9789b83ad664384be98880639c3cf # v2.0.1
+      - uses: carvel-dev/setup-action@efbf2625e8469080d87175c02690634d4b0ad476 # v2.2.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           only: ytt
@@ -24,7 +24,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: ${{ github.workspace }}/.github/scripts/update-versions.sh
       - run: ${{ github.workspace }}/.github/scripts/validate-compatibility.sh
-      - uses: peter-evans/create-pull-request@c0f553fe549906ede9cf27b5156039d195d2ece0 # v8.1.0
+      - uses: peter-evans/create-pull-request@15733dbdfeedb4f7fdb73d13c6f5ac83b710fab8 # v8.1.2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: '[skip ci] Update discussion template versions'

@@ -60,7 +60,8 @@
          tracking_status/2,
          get_overview/1]).
 
--export([check_max_segment_size_bytes/1]).
+-export([check_max_segment_size_bytes/1,
+         stream_message/1]).
 
 -export([policy_apply_to_name/0,
          stop/1,
@@ -169,6 +170,10 @@ check_max_segment_size_bytes(Q) ->
         {_Type, Val} when Val > ?MAX_STREAM_MAX_SEGMENT_SIZE ->
             {protocol_error, precondition_failed, "Exceeded max value for x-stream-max-segment-size-bytes",
              []};
+        {_Type, Val} when Val < ?MIN_STREAM_MAX_SEGMENT_SIZE ->
+            {protocol_error, precondition_failed,
+             "Value for x-stream-max-segment-size-bytes is below the minimum of ~b",
+             [?MIN_STREAM_MAX_SEGMENT_SIZE]};
         _ ->
             ok
     end.
@@ -600,7 +605,9 @@ stream_message(Msg) ->
         undefined ->
             MsgData;
         {utf8, Value} ->
-            {Value, MsgData}
+            {Value, MsgData};
+        _ ->
+            MsgData
     end.
 
 -spec dequeue(_, _, _, _, _, client()) -> no_return().

@@ -46,17 +46,27 @@ allow_missing_post(ReqData, Context) ->
     {false, ReqData, Context}.
 
 content_types_accepted(ReqData, Context) ->
-   {[{'*', accept_content}], ReqData, Context}.
+   {[{{<<"application">>, <<"json">>, '*'}, accept_content}], ReqData, Context}.
 
 accept_content(ReqData, Context) ->
-    rabbit_mgmt_util:post_respond(do_it(ReqData, Context)).
+    case rabbit_alarm:get_alarms() of
+        [] ->
+            rabbit_mgmt_util:post_respond(do_it(ReqData, Context));
+        Alarms ->
+            Resources = lists:usort([R || {{resource_limit, R, _}, _} <- Alarms]),
+            Reason = rabbit_misc:format(
+                       "Publishing is blocked by a resource alarm: ~ts",
+                       [lists:join(", ", [atom_to_list(R) || R <- Resources])]),
+            rabbit_mgmt_util:service_unavailable(Reason, ReqData, Context)
+    end.
 
 do_it(ReqData0, Context) ->
     VHost = rabbit_mgmt_util:vhost(ReqData0),
     X = rabbit_mgmt_util:id(exchange, ReqData0),
     rabbit_mgmt_util:with_decode(
       [routing_key, properties, payload, payload_encoding], ReqData0, Context,
-      fun ([RoutingKey, Props0, Payload0, Enc], _, ReqData) when is_binary(Payload0) ->
+      fun ([RoutingKey, Props0, Payload0, Enc], _, ReqData)
+            when is_binary(Payload0), is_binary(RoutingKey) ->
               rabbit_mgmt_util:with_channel(
                 VHost, ReqData, Context,
                 fun (Ch) ->
@@ -93,6 +103,8 @@ do_it(ReqData0, Context) ->
                                 bad(confirm_timeout, MRef, ReqData, Context)
                         end
                 end);
+          ([_RoutingKey, _Props, Payload, _Enc], _, _ReqData) when is_binary(Payload) ->
+              throw({error, routing_key_not_string});
           ([_RoutingKey, _Props, _Payload, _Enc], _, _ReqData) ->
               throw({error, payload_not_string})
       end).

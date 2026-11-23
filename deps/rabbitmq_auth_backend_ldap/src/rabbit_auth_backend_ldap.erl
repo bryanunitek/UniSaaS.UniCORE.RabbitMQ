@@ -27,7 +27,8 @@
 %% for tests
 -export([purge_connections/0,
          fill_user_dn_pattern/1, escaped_user_dn/1, simple_bind_fill_pattern/1,
-         fill_dn_with_username/2, invalid_credentials_refused/1, with_login/4]).
+         fill_dn_with_username/2, invalid_credentials_refused/1, with_login/4,
+         evaluate/4]).
 
 -define(L(F, A),  log("LDAP "         ++ F, A)).
 -define(L1(F, A), log("    LDAP "     ++ F, A)).
@@ -73,6 +74,10 @@ user_login_authentication(Username, []) ->
 user_login_authentication(Username, AuthProps) when is_list(AuthProps) ->
     case extractPassword(AuthProps) of
         undefined -> user_login_authentication(Username, []);
+        invalid ->
+            ?L("CHECK: login for ~ts", [Username]),
+            ?L("DECISION: login for ~ts: denied, no valid password provided", [Username]),
+            {refused, "user '~ts' - no valid password provided", [Username]};
         <<>> ->
             %% Password "" is special in LDAP, see
             %% https://tools.ietf.org/html/rfc4513#section-5.1.2
@@ -98,7 +103,7 @@ user_login_authentication(Username, _AuthProps) ->
 %% Credentials (i.e. password) maybe directly in the password attribute in AuthProps
 %% or as a Function with the attribute rabbit_auth_backend_ldap if the user was already authenticated with http backend
 %% or as a Function with the attribute rabbit_auth_backend_cache if the user was already authenticated via cache backend
--spec extractPassword(list()) -> rabbit_types:option(binary()).
+-spec extractPassword(list()) -> rabbit_types:option(binary()) | invalid.
 extractPassword(AuthProps) ->
     case proplists:get_value(password, AuthProps, none) of
         none ->
@@ -106,14 +111,18 @@ extractPassword(AuthProps) ->
                 none -> case proplists:get_value(rabbit_auth_backend_cache, AuthProps, none) of
                             none -> undefined;
                             PasswordFun ->
-                                (PasswordFun())#impl.password
+                                normalize_password((PasswordFun())#impl.password)
                         end;
                 PasswordFun ->
-                    (PasswordFun())#impl.password
+                    normalize_password((PasswordFun())#impl.password)
             end;
         Password ->
-            Password
+            normalize_password(Password)
     end.
+
+normalize_password(none) -> undefined;
+normalize_password(Password) when is_binary(Password) -> Password;
+normalize_password(_) -> invalid.
 
 user_login_authorization(Username, AuthProps) ->
     case user_login_authentication(Username, AuthProps) of
@@ -330,21 +339,21 @@ evaluate0({match, {string, _} = StringQuery, {string, _} = REQuery}, Args, User,
                       do_match(String1, String2)
               end,
               evaluate(StringQuery, Args, User, LDAP),
-              evaluate(REQuery, Args, User, LDAP));
+              evaluate_re(REQuery, Args, User, LDAP));
 
 evaluate0({match, StringQuery, {string, _} = REQuery}, Args, User, LDAP) when is_list(StringQuery)->
     safe_eval(fun (String1, String2) ->
                       do_match(String1, String2)
               end,
         evaluate(StringQuery, Args, User, LDAP),
-        evaluate(REQuery, Args, User, LDAP));
+        evaluate_re(REQuery, Args, User, LDAP));
 
 evaluate0({match, {string, _} = StringQuery, REQuery}, Args, User, LDAP) when is_list(REQuery) ->
     safe_eval(fun (String1, String2) ->
                       do_match(String1, String2)
               end,
         evaluate(StringQuery, Args, User, LDAP),
-        evaluate(REQuery, Args, User, LDAP));
+        evaluate_re(REQuery, Args, User, LDAP));
 
 evaluate0({match, StringQuery, REQuery}, Args, User, LDAP) when is_list(StringQuery),
                                                                 is_list(REQuery)  ->
@@ -352,14 +361,14 @@ evaluate0({match, StringQuery, REQuery}, Args, User, LDAP) when is_list(StringQu
                       do_match(String1, String2)
               end,
         evaluate(StringQuery, Args, User, LDAP),
-        evaluate(REQuery, Args, User, LDAP));
+        evaluate_re(REQuery, Args, User, LDAP));
 
 evaluate0({match, StringQuery, REQuery}, Args, User, LDAP) ->
     safe_eval(fun (String1, String2) ->
                       do_match_multi(String1, String2)
               end,
         evaluate(StringQuery, Args, User, LDAP),
-        evaluate(REQuery, Args, User, LDAP));
+        evaluate_re(REQuery, Args, User, LDAP));
 
 evaluate0(StringPattern, Args, User, LDAP) when is_list(StringPattern) ->
     evaluate0({string, StringPattern}, Args, User, LDAP);
@@ -379,9 +388,18 @@ evaluate0({attribute, DNPattern, AttributeName}, Args, _User, LDAP) ->
 evaluate0(Q, Args, _User, _LDAP) ->
     {error, {unrecognised_query, Q, Args}}.
 
+evaluate_re(Pattern, Args, User, LDAP) when is_list(Pattern) ->
+    evaluate_re({string, Pattern}, Args, User, LDAP);
+evaluate_re({string, Pattern}, Args, _User, _LDAP) ->
+    R = rabbit_auth_backend_ldap_util:fill_re(Pattern, Args),
+    ?L1("evaluated regular expression for \"~ts\"", [R]),
+    R;
+evaluate_re(Query, Args, User, LDAP) ->
+    evaluate(Query, Args, User, LDAP).
+
 search_groups(LDAP, Desc, GroupsBase, Scope, DN) ->
     Filter = eldap:equalityMatch(Desc, DN),
-    case eldap:search(LDAP,
+    case search(LDAP,
                       [{base, GroupsBase},
                        {filter, Filter},
                        {attributes, ["dn"]},
@@ -475,7 +493,7 @@ log_match(String, RE, Result) ->
          format_multi_attr(RE), Result]).
 
 object_exists(DN, Filter, LDAP) ->
-    case eldap:search(LDAP,
+    case search(LDAP,
                       [{base, DN},
                        {filter, Filter},
                        {attributes, ["objectClass"]}, %% Reduce verbiage
@@ -489,7 +507,7 @@ object_exists(DN, Filter, LDAP) ->
     end.
 
 attribute(DN, AttributeName, LDAP) ->
-    case eldap:search(LDAP,
+    case search(LDAP,
                       [{base, DN},
                        {filter, eldap:present("objectClass")},
                        {attributes, [AttributeName]}]) of
@@ -575,49 +593,22 @@ with_login(_Creds, _Servers, _Opts, _Fun, 0 = _RetriesLeft) ->
 with_login(Creds, Servers, Opts, Fun, RetriesLeft) ->
     case get_or_create_conn(Creds == anon, Servers, Opts) of
         {ok, {ConnType, LDAP}} ->
-            Result = case Creds of
-                         anon ->
-                             ?L1("anonymous bind", []),
-                             case call_ldap_fun(Fun, LDAP) of
-                                 {error, ldap_closed} ->
-                                     purge_connection(Creds, Servers, Opts),
-                                     with_login(Creds, Servers, Opts, Fun, RetriesLeft - 1);
-                                 Other -> Other
-                             end;
-                         {UserDN, Password} ->
-                             case eldap:simple_bind(LDAP, UserDN, Password) of
-                                 ok ->
-                                     ?L1("bind succeeded: ~ts",
-                                         [scrub_dn(UserDN, env(log))]),
-                                     case call_ldap_fun(Fun, LDAP, UserDN) of
-                                         {error, ldap_closed} ->
-                                             with_login(Creds, Servers, Opts, Fun, RetriesLeft - 1);
-                                         {error, {gen_tcp_error, _}} ->
-                                             with_login(Creds, Servers, Opts, Fun, RetriesLeft - 1);
-                                         Other -> Other
-                                     end;
-                                 {error, invalidCredentials} ->
-                                     ?L1("bind returned \"invalid credentials\": ~ts",
-                                         [scrub_dn(UserDN, env(log))]),
-                                     invalid_credentials_refused(UserDN);
-                                 {error, ldap_closed} ->
-                                     purge_connection(Creds, Servers, Opts),
-                                     with_login(Creds, Servers, Opts, Fun, RetriesLeft - 1);
-                                 {error, {gen_tcp_error, _}} ->
-                                     purge_connection(Creds, Servers, Opts),
-                                     with_login(Creds, Servers, Opts, Fun, RetriesLeft - 1);
-                                 {error, E} ->
-                                     ?L1("bind error: ~tp ~tp",
-                                         [scrub_dn(UserDN, env(log)), E]),
-                                     %% Do not report internal bind error to a client
-                                     {error, ldap_bind_error}
-                             end
-                     end,
-            ok = case ConnType of
-                     eldap_transient -> eldap:close(LDAP);
-                     _ -> ok
-                 end,
-            Result;
+            try
+                login(Creds, LDAP, Fun)
+            catch
+                throw:{ldap_connection_error, LDAP, _} ->
+                    case ConnType of
+                        eldap_transient -> unlink(LDAP), exit(LDAP, closed);
+                        _               -> ok
+                    end,
+                    purge_connection(Creds, Servers, Opts),
+                    with_login(Creds, Servers, Opts, Fun, RetriesLeft - 1)
+            after
+                case ConnType of
+                    eldap_transient -> eldap:close(LDAP);
+                    _               -> ok
+                end
+            end;
         Error ->
             ?L1("connect error: ~tp", [Error]),
             case Error of
@@ -627,6 +618,49 @@ with_login(Creds, Servers, Opts, Fun, RetriesLeft) ->
             end
     end.
 
+login(anon, LDAP, Fun) ->
+    ?L1("anonymous bind", []),
+    call_ldap_fun(Fun, LDAP, "");
+login({UserDN, Password}, LDAP, Fun) ->
+    case ldap_result(LDAP, eldap:simple_bind(LDAP, UserDN, Password)) of
+        ok ->
+            ?L1("bind succeeded: ~ts", [scrub_dn(UserDN, env(log))]),
+            call_ldap_fun(Fun, LDAP, UserDN);
+        {error, invalidCredentials} ->
+            ?L1("bind returned \"invalid credentials\": ~ts",
+                [scrub_dn(UserDN, env(log))]),
+            invalid_credentials_refused(UserDN);
+        {error, E} ->
+            ?L1("bind error: ~tp ~tp", [scrub_dn(UserDN, env(log)), E]),
+            {error, ldap_bind_error}
+    end.
+
+search(LDAP, Args) ->
+    ldap_result(LDAP, eldap:search(LDAP, Args)).
+
+ldap_result(LDAP, {error, Reason} = Error) ->
+    case Reason of
+        ldap_closed        -> throw({ldap_connection_error, LDAP, Error});
+        {gen_tcp_error, _} -> throw({ldap_connection_error, LDAP, Error});
+        _ ->
+            case is_late_reply(Reason) of
+                true  -> throw({ldap_connection_error, LDAP, Error});
+                false -> Error
+            end
+    end;
+ldap_result(_LDAP, Result) ->
+    Result.
+
+%% eldap wraps a reply to a different request in an error tuple.
+is_late_reply({ok, Msg}) ->
+    is_tuple(Msg) andalso element(1, Msg) =:= 'LDAPMessage';
+is_late_reply({Op, _}) ->
+    lists:member(Op, [bindResponse, searchResEntry, searchResDone, searchResRef,
+                     modifyResponse, addResponse, delResponse, modDNResponse,
+                     compareResponse, extendedResp, intermediateResponse]);
+is_late_reply(_) ->
+    false.
+
 purge_connection(Creds, Servers, Opts) ->
     %% purge and retry with a new connection
     ?LOG_WARNING("TCP connection to a LDAP server was closed or otherwise defunct.",
@@ -635,17 +669,8 @@ purge_connection(Creds, Servers, Opts) ->
     ?LOG_WARNING("LDAP will retry with a new connection.",
                  #{domain => ?RMQLOG_DOMAIN_LDAP}).
 
-call_ldap_fun(Fun, LDAP) ->
-    call_ldap_fun(Fun, LDAP, "").
-
 call_ldap_fun(Fun, LDAP, UserDN) ->
-    case Fun(LDAP) of
-        {error, ldap_closed} ->
-            %% LDAP connection was close, let with_login/5 retry
-            {error, ldap_closed};
-        {error, {gen_tcp_error, E}} ->
-            %% ditto
-            {error, {gen_tcp_error, E}};
+    case ldap_result(LDAP, Fun(LDAP)) of
         {error, E} ->
             ?L1("evaluate error: ~ts ~tp", [scrub_dn(UserDN, env(log)), E]),
             {error, ldap_evaluate_error};
@@ -744,19 +769,27 @@ is_multi_attr_member(Str1, Str2) ->
     lists:member(Str1, Str2) orelse lists:member(Str2, Str1).
 
 purge_conn(IsAnon, Servers, Opts) ->
-    Conns = get(ldap_conns),
+    Conns = case get(ldap_conns) of
+                undefined -> #{};
+                Dict      -> Dict
+            end,
     Key = {IsAnon, Servers, Opts},
-    {ok, Conn} = maps:find(Key, Conns),
-    ?LOG_WARNING("LDAP will purge an already closed or defunct LDAP server connection from the pool",
-                 #{domain => ?RMQLOG_DOMAIN_LDAP}),
-    % We cannot close the connection with eldap:close/1 because as of OTP-13327
-    % eldap will try to do_unbind first and will fail with a `{gen_tcp_error, closed}`.
-    % Since we know that the connection is already closed, we just
-    % kill its process.
-    unlink(Conn),
-    exit(Conn, closed),
-    put(ldap_conns, maps:remove(Key, Conns)),
-    ok.
+    case maps:find(Key, Conns) of
+        {ok, Conn} ->
+            ?LOG_WARNING("LDAP will purge an already closed or defunct LDAP server connection from the pool",
+                         #{domain => ?RMQLOG_DOMAIN_LDAP}),
+            % We cannot close the connection with eldap:close/1 because as of OTP-13327
+            % eldap will try to do_unbind first, which fails or waits on a defunct
+            % connection, so we kill its process.
+            unlink(Conn),
+            exit(Conn, closed),
+            put(ldap_conns, maps:remove(Key, Conns)),
+            ok;
+        error ->
+            %% One-off connections (`idle_timeout = 0`) are never pooled, and
+            %% nothing is pooled when the connection could not be opened.
+            ok
+    end.
 
 eldap_open(Servers, Opts) ->
     case eldap:open(Servers, ssl_conf() ++ Opts) of
@@ -769,7 +802,9 @@ eldap_open(Servers, Opts) ->
                                   ELDAP = eldap, %% Fool xref
                                   case ELDAP:start_tls(LDAP, TLSOpts) of
                                       ok    -> {ok, LDAP};
-                                      Error -> Error
+                                      Error -> unlink(LDAP),
+                                               exit(LDAP, closed),
+                                               Error
                                   end
             end;
         Error ->
@@ -902,7 +937,7 @@ dn_lookup(Username, LDAP) ->
     Filled = fill_user_dn_pattern(Username),
     DnLookupBase = get_expected_env_str(dn_lookup_base, none),
     DnLookupAttribute = get_expected_env_str(dn_lookup_attribute, none),
-    case eldap:search(LDAP,
+    case search(LDAP,
                       [{base, DnLookupBase},
                        {filter, eldap:equalityMatch(DnLookupAttribute, Filled)},
                        {attributes, ["distinguishedName"]}]) of

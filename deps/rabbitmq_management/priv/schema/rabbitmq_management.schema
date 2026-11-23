@@ -37,6 +37,14 @@ fun(Conf) ->
 end}.
 
 
+%% Upper bounds for a single "get messages" HTTP API request
+
+{mapping, "management.polling_consumer.max_messages", "rabbitmq_management.basic_get_max_messages",
+    [{datatype, integer}, {validators, ["non_zero_positive_integer"]}]}.
+
+{mapping, "management.polling_consumer.max_payload_bytes", "rabbitmq_management.basic_get_max_payload_bytes",
+    [{datatype, bytesize}, {validators, ["non_zero_positive_integer"]}]}.
+
 %% Number of delegate processes to use for metrics acquisition intra-cluster
 %% communication. On a machine which has a very large number of cores and is
 %% also part of a cluster, you may wish to increase this value.
@@ -594,8 +602,7 @@ end}.
 {mapping,
   "management.oauth_resource_servers.$name.disabled",
   "rabbitmq_management.oauth_resource_servers", [
-   {datatype, boolean},
-   {include_default, false}
+   {datatype, boolean}
 ]}.
 
 {mapping,
@@ -710,20 +717,17 @@ end}.
 %% Disables setting operator policies over API.
 
 {mapping, "management.restrictions.operator_policy_changes.disabled", "rabbitmq_management.restrictions.operator_policy_changes.disabled", [
-    {datatype, boolean},
-    {include_default, false}
+    {datatype, boolean}
 ]}.
 
 %% Disables add/remove/grow/shrink over API.
 
 {mapping, "management.restrictions.quorum_queue_replica_operations.disabled", "rabbitmq_management.restrictions.quorum_queue_replica_operations.disabled", [
-    {datatype, boolean},
-    {include_default, false}
+    {datatype, boolean}
 ]}.
 
 %% Require authentication for the HTTP API reference page.
 
 {mapping, "management.require_auth_for_api_reference", "rabbitmq_management.require_auth_for_api_reference", [
-    {datatype, boolean},
-    {include_default, false}
+    {datatype, boolean}
 ]}.

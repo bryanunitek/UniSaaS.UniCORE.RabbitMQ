@@ -8,7 +8,8 @@
 -export([register/0,
          deregister_cleanup/1,
          collect_mf/2,
-         collect_metrics/2]).
+         collect_metrics/2,
+         matches_queue_filter/2]).
 
 -import(prometheus_model_helpers, [create_mf/4,
                                    create_mf/5,
@@ -52,6 +53,7 @@
 % It is a Prometheus best practice to use specific base units: https://prometheus.io/docs/practices/naming/#base-units
 % Extra context: https://github.com/prometheus/docs/pull/1414#issuecomment-522337895
 
+-define(QUEUE_FILTER_MATCH_LIMIT, 2000).
 -define(MILLISECOND, 1000).
 -define(MICROSECOND, 1000000).
 
@@ -385,7 +387,7 @@ build_info() ->
                  end,
     {
         build_info,
-        untyped,
+        gauge,
         "RabbitMQ & Erlang/OTP version info",
         [{
             Properties,
@@ -396,7 +398,7 @@ build_info() ->
 identity_info(Endpoint) ->
     {
         identity_info,
-        untyped,
+        gauge,
         "RabbitMQ node & cluster identity info",
         [{
             [
@@ -613,13 +615,13 @@ metric(boolean, Labels, Value0) ->
                 false -> 0;
                 undefined -> undefined
             end,
-    untyped_metric(Labels, Value).
+    gauge_metric(Labels, Value).
 
 %%====================================================================
 %% Private Parts
 %%====================================================================
 catch_boolean(boolean) ->
-        untyped;
+        gauge;
 catch_boolean(T) ->
         T.
 
@@ -878,7 +880,9 @@ get_data(exchange_bindings, _, _, _) ->
                           end
                   end, Exchanges),
     maps:fold(fun(#resource{virtual_host = VHost, name = Name}, #{type := Type, binding_count := Bindings}, Acc) ->
-                      [{<<"vhost=\"", VHost/binary, "\",exchange=\"", Name/binary, "\",type=\"", Type/binary, "\"">>,
+                      [{<<"vhost=\"", (escape_label_value(VHost))/binary,
+                          "\",exchange=\"", (escape_label_value(Name))/binary,
+                          "\",type=\"", (escape_label_value(Type))/binary, "\"">>,
                         Bindings}|Acc]
               end, [], WithCount);
 get_data(exchange_names, _, _, _) ->
@@ -888,7 +892,9 @@ get_data(exchange_names, _, _, _) ->
                     (#exchange{name = #resource{name = <<>>}}, Acc) ->
                         Acc;
                     (#exchange{name = #resource{virtual_host = VHost, name = Name}, type = EType}, Acc) ->
-                        Label = <<"vhost=\"", VHost/binary, "\",exchange=\"", Name/binary, "\",type=\"", (atom_to_binary(EType))/binary, "\"">>,
+                        Label = <<"vhost=\"", (escape_label_value(VHost))/binary,
+                                  "\",exchange=\"", (escape_label_value(Name))/binary,
+                                  "\",type=\"", (escape_label_value(atom_to_binary(EType)))/binary, "\"">>,
                         [{Label, 1}|Acc]
                 end, [], rabbit_exchange:list());
 get_data(Table, _, _, _) ->
@@ -962,7 +968,7 @@ queue_filter_from_pdict() ->
 matches_queue_filter(_QName, false) ->
     true;
 matches_queue_filter(QName, MP) ->
-    rabbit_re:matches(QName, MP).
+    rabbit_re:matches(QName, MP, [{match_limit, ?QUEUE_FILTER_MATCH_LIMIT}]).
 
 filter_by_queue_name(Rows, false) ->
     Rows;

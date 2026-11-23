@@ -18,6 +18,8 @@
          clear_cache_cluster_wide/0, clear_cache/0,
          init_key_salt/0, cache_key/2]).
 
+-define(AUTHN_IMPL(Impl), {?MODULE, authn, Impl}).
+
 %% API
 
 -spec user_login_authentication(rabbit_types:username(), [term()] | map()) ->
@@ -25,12 +27,13 @@
     {'refused', string(), [any()]} |
     {'error', any()}.
 user_login_authentication(Username, AuthProps) ->
-    with_cache(authn, {user_login_authentication, [Username, AuthProps]},
+    Result = with_cache(authn, {user_login_authentication, [Username, AuthProps]},
         fun({ok, _})          -> success;
            ({refused, _, _})  -> refusal;
            ({error, _} = Err) -> Err;
            (_)                -> unknown
-        end).
+        end),
+    tag_authn_impl(Result).
 
 -spec user_login_authorization(rabbit_types:username(), [term()] | map()) ->
     {'ok', any()} |
@@ -75,6 +78,12 @@ check_topic_access(#auth_user{} = AuthUser,
                fun convert_backend_result/1).
 
 -spec expiry_timestamp(rabbit_types:auth_user()) -> integer() | never.
+expiry_timestamp(#auth_user{impl = ?AUTHN_IMPL(Impl)} = AuthUser) ->
+    Backend = get_cached_backend(authn),
+    case erlang:function_exported(Backend, expiry_timestamp, 1) of
+        true  -> Backend:expiry_timestamp(AuthUser#auth_user{impl = Impl});
+        false -> never
+    end;
 expiry_timestamp(AuthUser) ->
     Backend = get_cached_backend(authz),
     Backend:expiry_timestamp(AuthUser).
@@ -83,6 +92,10 @@ expiry_timestamp(AuthUser) ->
     {'ok', rabbit_types:auth_user()} |
     {'refused', string(), [any()]} |
     {'error', any()}.
+update_state(#auth_user{impl = ?AUTHN_IMPL(Impl)} = AuthUser, NewState) ->
+    Backend = get_cached_backend(authn),
+    tag_authn_impl(
+      Backend:update_state(AuthUser#auth_user{impl = Impl}, NewState));
 update_state(AuthUser, NewState) ->
     Backend = get_cached_backend(authz),
     Backend:update_state(AuthUser, NewState).
@@ -90,6 +103,17 @@ update_state(AuthUser, NewState) ->
 %%
 %% Implementation
 %%
+
+%% When different backends are cached for authn and authz, mark the state
+%% returned by the former so that `expiry_timestamp/1' and `update_state/2'
+%% hand it back to the backend it belongs to.
+tag_authn_impl({ok, #auth_user{impl = Impl} = AuthUser} = Result) ->
+    case get_cached_backend(authn) =:= get_cached_backend(authz) of
+        true  -> Result;
+        false -> {ok, AuthUser#auth_user{impl = ?AUTHN_IMPL(Impl)}}
+    end;
+tag_authn_impl(Result) ->
+    Result.
 
 convert_backend_result(true) -> success;
 convert_backend_result(false) -> refusal;
@@ -121,11 +145,50 @@ with_cache(BackendType, {F, A}, Fun) ->
                                             cache_ttl),
             BackendResult = apply(Backend, F, A),
             case should_cache(BackendResult, Fun) of
-                true  -> ok = AuthCache:put(Key, BackendResult, TTL);
+                true  ->
+                    case entry_ttl(Backend, A, BackendResult, TTL) of
+                        EntryTTL when EntryTTL > 0 ->
+                            ok = AuthCache:put(Key, BackendResult, EntryTTL);
+                        _ ->
+                            ok
+                    end;
                 false -> ok
             end,
             BackendResult
     end.
+
+%% Entries expire no later than the credentials they were computed for.
+entry_ttl(Backend, A, BackendResult, TTL) ->
+    case credentials_expiry_timestamp(Backend, auth_user(A, BackendResult)) of
+        never ->
+            TTL;
+        Ts when is_integer(Ts) ->
+            %% Backends reject credentials once `Ts =< now` (in seconds) while
+            %% `rabbit_auth_cache:expired/1` keeps an entry until `now > Exp`
+            %% (in milliseconds), hence the extra millisecond.
+            min(TTL, Ts * 1000 - os:system_time(millisecond) - 1)
+    end.
+
+credentials_expiry_timestamp(_Backend, undefined) ->
+    never;
+credentials_expiry_timestamp(Backend, #auth_user{} = AuthUser) ->
+    %% An authentication-only backend may not implement this
+    %% `rabbit_authz_backend` callback.
+    case erlang:function_exported(Backend, expiry_timestamp, 1) of
+        true  -> Backend:expiry_timestamp(AuthUser);
+        false -> never
+    end.
+
+auth_user([#auth_user{} = AuthUser | _], _BackendResult) ->
+    AuthUser;
+auth_user([_Username, _AuthProps], {ok, #auth_user{} = AuthUser}) ->
+    AuthUser;
+auth_user([Username, _AuthProps], {ok, Impl}) ->
+    #auth_user{username = Username, tags = [], impl = Impl};
+auth_user([Username, _AuthProps], {ok, Impl, Tags}) ->
+    #auth_user{username = Username, tags = Tags, impl = Impl};
+auth_user(_A, _BackendResult) ->
+    undefined.
 
 %% Keep plaintext credentials out of the cache key. The full args are still
 %% passed to the underlying backend; only the lookup key is redacted.

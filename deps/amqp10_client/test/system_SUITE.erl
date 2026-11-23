@@ -57,12 +57,17 @@ groups() ->
                  attach_refused,
                  incoming_heartbeat,
                  multi_transfer_without_delivery_id,
+                 multi_transfer_max_message_size_exceeded,
+                 multi_transfer_on_sender_link,
                  disposition_large_range_settles_outgoing,
                  link_credit_max,
                  drain_with_nothing_available,
                  frame_size_too_small_rejected,
                  max_frame_size_exceeded_rejected,
-                 connect_timeout
+                 connect_timeout,
+                 handshake_owner_down,
+                 sasl_failure_peer_keeps_socket_open,
+                 sasl_failure_peer_closes_socket
                 ]}
     ].
 
@@ -855,6 +860,79 @@ connect_timeout(_Config) ->
     end,
     ok = gen_tcp:close(Listener).
 
+handshake_owner_down(_Config) ->
+    {ok, Listener} = gen_tcp:listen(0, [{active, false}]),
+    {ok, Port} = inet:port(Listener),
+    Cfg = #{address => "localhost", port => Port, sasl => none},
+    Self = self(),
+    Owner = spawn(fun() ->
+                          {ok, Connection} = amqp10_client:open_connection(Cfg),
+                          link(Connection),
+                          Self ! {connection, Connection},
+                          receive stop -> ok end
+                  end),
+    Connection = receive {connection, C} -> C after 5000 -> ct:fail(no_connection) end,
+    MRef = monitor(process, Connection),
+    Owner ! stop,
+    receive
+        {'DOWN', MRef, process, Connection, {shutdown, owner_down}} -> ok
+    after 5000 -> ct:fail(connection_still_running)
+    end,
+    ok = gen_tcp:close(Listener).
+
+sasl_failure_peer_keeps_socket_open(_Config) ->
+    sasl_failure_frees_connection_processes(false).
+
+sasl_failure_peer_closes_socket(_Config) ->
+    sasl_failure_frees_connection_processes(true).
+
+sasl_failure_frees_connection_processes(PeerCloses) ->
+    {ok, Listener} = gen_tcp:listen(0, [binary, {active, false}]),
+    {ok, Port} = inet:port(Listener),
+    Peer = spawn_link(fun() -> sasl_failure_peer(Listener, PeerCloses) end),
+    Cfg = #{address => "localhost", port => Port, sasl => anon, notify => self()},
+    {ok, Connection} = amqp10_client:open_connection(Cfg),
+    {dictionary, Dict} = process_info(Connection, dictionary),
+    [Sup | _] = proplists:get_value('$ancestors', Dict),
+    Children = supervisor:which_children(Sup),
+    {reader, Reader, _, _} = lists:keyfind(reader, 1, Children),
+    Pids = [Sup | [Pid || {_, Pid, _, _} <- Children]],
+    {links, Links} = process_info(Reader, links),
+    [Socket] = [L || L <- Links, is_port(L)],
+    MRefs = [monitor(process, Pid) || Pid <- Pids],
+    Peer ! go,
+    receive
+        {amqp10_event, {connection, Connection, {closed, sasl_auth_failure}}} -> ok
+    after ?TIMEOUT -> ct:fail(connection_not_closed)
+    end,
+    [receive
+         {'DOWN', MRef, process, _, _} -> ok
+     after 5000 -> ct:fail({process_still_alive, [P || P <- Pids, is_process_alive(P)]})
+     end || MRef <- MRefs],
+    ?assertEqual(undefined, erlang:port_info(Socket)),
+    Peer ! stop,
+    ok = gen_tcp:close(Listener).
+
+sasl_failure_peer(Listener, PeerCloses) ->
+    {ok, Sock} = gen_tcp:accept(Listener),
+    receive go -> ok end,
+    {ok, <<"AMQP", 3, 1, 0, 0>>} = gen_tcp:recv(Sock, 8),
+    Mechs = #'v1_0.sasl_mechanisms'{
+               sasl_server_mechanisms = {array, symbol, [{symbol, <<"ANONYMOUS">>}]}},
+    Outcome = #'v1_0.sasl_outcome'{code = {ubyte, 1}},
+    ok = gen_tcp:send(Sock, <<"AMQP", 3, 1, 0, 0>>),
+    ok = gen_tcp:send(Sock, sasl_frame(Mechs)),
+    {ok, _SaslInit} = gen_tcp:recv(Sock, 0),
+    ok = gen_tcp:send(Sock, sasl_frame(Outcome)),
+    case PeerCloses of
+        true -> gen_tcp:close(Sock);
+        false -> receive stop -> gen_tcp:close(Sock) end
+    end.
+
+sasl_frame(Performative) ->
+    amqp10_binary_generator:build_frame(
+      0, 1, [amqp10_framing:encode_bin(Performative)]).
+
 open_refused(Config) ->
     Hostname = ?config(mock_host, Config),
     Port = ?config(mock_port, Config),
@@ -1198,6 +1276,156 @@ multi_transfer_without_delivery_id(Config) ->
     ok = amqp10_client:end_session(Session),
     ok = amqp10_client:close_connection(Connection),
     ok.
+
+multi_transfer_max_message_size_exceeded(Config) ->
+    Hostname = ?config(mock_host, Config),
+    Port = ?config(mock_port, Config),
+    OpenStep = fun({0 = Ch, #'v1_0.open'{}, _Pay}) ->
+                       {Ch, [#'v1_0.open'{container_id = {utf8, <<"mock">>}}]}
+               end,
+    BeginStep = fun({0 = Ch, #'v1_0.begin'{}, _Pay}) ->
+                         {Ch, [#'v1_0.begin'{remote_channel = {ushort, Ch},
+                                             next_outgoing_id = {uint, 1},
+                                             incoming_window = {uint, 1000},
+                                             outgoing_window = {uint, 1000}}
+                                             ]}
+                end,
+    AttachStep = fun({0 = Ch, #'v1_0.attach'{role = true,
+                                             name = Name,
+                                             source = Source,
+                                             max_message_size = {ulong, 20}}, <<>>}) ->
+                         {Ch, [#'v1_0.attach'{name = Name,
+                                              handle = {uint, 99},
+                                              initial_delivery_count = {uint, 1},
+                                              source = Source,
+                                              role = false}
+                              ]}
+                 end,
+    %% Each data section with a 5 byte content is 10 bytes.
+    Frame = fun(DeliveryId, Content, More) ->
+                    [#'v1_0.transfer'{handle = {uint, 99},
+                                      delivery_id = DeliveryId,
+                                      more = More},
+                     #'v1_0.data'{content = Content}]
+            end,
+    LinkCreditStep = fun({0 = Ch, #'v1_0.flow'{}, <<>>}) ->
+                             {Ch, {multi, [Frame({uint, 1}, <<"aaaaa">>, true),
+                                           Frame(undefined, <<"bbbbb">>, false),
+                                           Frame({uint, 2}, <<"ccccc">>, true),
+                                           Frame(undefined, <<"ddddd">>, true),
+                                           Frame(undefined, <<"eeeee">>, true),
+                                           Frame(undefined, <<"fffff">>, false)
+                                          ]}}
+                     end,
+    EndStep = fun({0 = Ch, #'v1_0.end'{error = #'v1_0.error'{
+                                                  condition = ?V_1_0_LINK_ERROR_MESSAGE_SIZE_EXCEEDED}},
+                   <<>>}) ->
+                      {Ch, [#'v1_0.end'{}]}
+              end,
+    Steps = [fun mock_server:recv_amqp_header_step/1,
+             fun mock_server:send_amqp_header_step/1,
+             mock_server:amqp_step(OpenStep),
+             mock_server:amqp_step(BeginStep),
+             mock_server:amqp_step(AttachStep),
+             mock_server:amqp_step(LinkCreditStep),
+             mock_server:amqp_step(EndStep)
+            ],
+    ok = mock_server:set_steps(?config(mock_server, Config), Steps),
+
+    Cfg = #{address => Hostname, port => Port, sasl => none, notify => self()},
+    {ok, Connection} = amqp10_client:open_connection(Cfg),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    {ok, Receiver} = amqp10_client:attach_link(
+                       Session, #{name => <<"mock1-received">>,
+                                  role => {receiver, #{address => <<"test">>,
+                                                       durable => none}, self()},
+                                  snd_settle_mode => unsettled,
+                                  rcv_settle_mode => first,
+                                  max_message_size => 20}),
+    ok = amqp10_client:flow_link_credit(Receiver, 100, 50),
+    receive
+        {amqp10_msg, Receiver, Msg} ->
+            ?assertEqual([<<"aaaaa">>, <<"bbbbb">>], amqp10_msg:body(Msg))
+    after ?TIMEOUT ->
+              ct:fail(delivery_timeout)
+    end,
+    receive
+        {amqp10_event,
+         {link, Receiver,
+          {detached, #'v1_0.error'{condition = ?V_1_0_LINK_ERROR_MESSAGE_SIZE_EXCEEDED}}}} -> ok
+    after ?TIMEOUT ->
+              flush(),
+              ct:fail(detach_timeout)
+    end,
+    receive
+        {amqp10_event, {session, Session, {ended, _}}} -> ok
+    after ?TIMEOUT ->
+              flush(),
+              ct:fail(session_end_timeout)
+    end,
+    assert_no_message(Receiver),
+    ok = amqp10_client:close_connection(Connection).
+
+multi_transfer_on_sender_link(Config) ->
+    Hostname = ?config(mock_host, Config),
+    Port = ?config(mock_port, Config),
+    OpenStep = fun({0 = Ch, #'v1_0.open'{}, _Pay}) ->
+                       {Ch, [#'v1_0.open'{container_id = {utf8, <<"mock">>}}]}
+               end,
+    BeginStep = fun({0 = Ch, #'v1_0.begin'{}, _Pay}) ->
+                         {Ch, [#'v1_0.begin'{remote_channel = {ushort, Ch},
+                                             next_outgoing_id = {uint, 1},
+                                             incoming_window = {uint, 1000},
+                                             outgoing_window = {uint, 1000}}
+                                             ]}
+                end,
+    AttachStep = fun({0 = Ch, #'v1_0.attach'{name = Name,
+                                             role = false,
+                                             target = Target}, <<>>}) ->
+                         Attach = #'v1_0.attach'{name = Name,
+                                                 handle = {uint, 99},
+                                                 role = true,
+                                                 target = Target},
+                         Transfer = [#'v1_0.transfer'{handle = {uint, 99},
+                                                      delivery_id = {uint, 1},
+                                                      more = true},
+                                     #'v1_0.data'{content = <<"aaaaa">>}],
+                         {Ch, {multi, [[Attach], Transfer]}}
+                 end,
+    EndStep = fun({0 = Ch, #'v1_0.end'{error = #'v1_0.error'{
+                                                  condition = ?V_1_0_AMQP_ERROR_NOT_ALLOWED}},
+                   <<>>}) ->
+                      {Ch, [#'v1_0.end'{}]}
+              end,
+    Steps = [fun mock_server:recv_amqp_header_step/1,
+             fun mock_server:send_amqp_header_step/1,
+             mock_server:amqp_step(OpenStep),
+             mock_server:amqp_step(BeginStep),
+             mock_server:amqp_step(AttachStep),
+             mock_server:amqp_step(EndStep)
+            ],
+    ok = mock_server:set_steps(?config(mock_server, Config), Steps),
+
+    Cfg = #{address => Hostname, port => Port, sasl => none, notify => self()},
+    {ok, Connection} = amqp10_client:open_connection(Cfg),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    {ok, Sender} = amqp10_client:attach_sender_link(Session, <<"mock1-sender">>,
+                                                    <<"test">>),
+    receive
+        {amqp10_event,
+         {link, Sender,
+          {detached, #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_NOT_ALLOWED}}}} -> ok
+    after ?TIMEOUT ->
+              flush(),
+              ct:fail(detach_timeout)
+    end,
+    receive
+        {amqp10_event, {session, Session, {ended, _}}} -> ok
+    after ?TIMEOUT ->
+              flush(),
+              ct:fail(session_end_timeout)
+    end,
+    ok = amqp10_client:close_connection(Connection).
 
 frame_size_too_small_rejected(Config) ->
     Hostname = ?config(mock_host, Config),

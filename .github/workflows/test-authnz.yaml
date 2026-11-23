@@ -3,7 +3,7 @@ on:
   push:
     branches:
       - main
-      - v4.0.x
+      - v4.3.x
     paths:
       - 'deps/rabbit/src/rabbit_auth**'
       - 'deps/rabbit/src/rabbit_access_control**'
@@ -41,7 +41,7 @@ jobs:
       DOCKER_NETWORK: rabbitmq_net
     steps:
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
 
     - name: Configure OTP & Elixir
       uses: erlef/setup-beam@v1

@@ -86,23 +86,9 @@ to_params([URI | Rest], Upstream, XorQ, _LastError) ->
                                   safe_uri = SafeURI,
                                   table    = params_table(SafeURI, XorQ)}};
         {error, {Info, _UnsafeURI}} ->
-            Error = {error, {sanitize_parse_error(Info), remove_credentials(URI)}},
+            Error = {error, {Info, remove_credentials(URI)}},
             to_params(Rest, Upstream, XorQ, Error)
     end.
-
-%% `amqp_uri:parse/2` embeds the full query string in some error `Info`
-%% shapes, and a TLS `password` (or other secret) can appear there. Redact
-%% the offending value and query before the error reaches the logs.
-sanitize_parse_error({invalid_ssl_parameter, Key, _Value, _Query, Reason}) ->
-    {invalid_ssl_parameter, Key, redacted, redacted, Reason};
-sanitize_parse_error({invalid_amqp_params_parameter, Field, _Value, _Query, Reason}) ->
-    {invalid_amqp_params_parameter, Field, redacted, redacted, Reason};
-sanitize_parse_error({unable_to_parse_uri, _Detail}) ->
-    %% The detail embeds the raw URI (with credentials) and an exit stack
-    %% trace. Neither is safe to log; the sanitized URI is reported separately.
-    unable_to_parse_uri;
-sanitize_parse_error(Info) ->
-    Info.
 
 %% Random permutation, used to spread load across an upstream's URIs.
 shuffle(List) ->
@@ -161,7 +147,7 @@ from_upstream_or_set(US, Name, U, XorQ) ->
               queue_name      = bget(queue,             US, U, name(XorQ)),
               consumer_tag    = bget('consumer-tag',    US, U, <<"federation-link-", Name/binary>>),
               prefetch_count  = bget('prefetch-count',  US, U, ?DEF_PREFETCH),
-              reconnect_delay = bget('reconnect-delay', US, U, 5),
+              reconnect_delay = max(0, bget('reconnect-delay', US, U, 5)),
               max_hops        = max_hops(bget('max-hops', US, U, ?DEF_MAX_HOPS)),
               expires         = bget(expires,           US, U, none),
               message_ttl     = bget('message-ttl',     US, U, none),

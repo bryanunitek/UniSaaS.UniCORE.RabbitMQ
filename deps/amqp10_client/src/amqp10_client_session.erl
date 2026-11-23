@@ -140,7 +140,8 @@
          link_credit = 0 :: non_neg_integer(),
          available = 0 :: non_neg_integer(),
          drain = false :: boolean(),
-         partial_transfers :: undefined | {#'v1_0.transfer'{}, [binary()]},
+         partial_transfers :: undefined | {#'v1_0.transfer'{}, [binary()],
+                                           Size :: non_neg_integer()},
          auto_flow :: never | {RenewWhenBelow :: pos_integer(),
                                Credit :: pos_integer()},
          incoming_unsettled = #{} :: #{delivery_number() => ok},
@@ -475,16 +476,24 @@ mapped(cast, #'v1_0.flow'{handle = {uint, InHandle}} = Flow,
     {keep_state, State1};
 mapped(cast, {#'v1_0.transfer'{handle = {uint, InHandle},
                                more = true} = Transfer, Payload},
-       #state{links = Links} = State0) ->
-
-    {ok, #link{output_handle = OutHandle} = Link} =
-        find_link_by_input_handle(InHandle, State0),
-
-    Link1 = append_partial_transfer(Transfer, Payload, Link),
-
-    State = book_partial_transfer_received(
-              State0#state{links = Links#{OutHandle => Link1}}),
-    {keep_state, State};
+       State0) ->
+    {ok, Link0} = find_link_by_input_handle(InHandle, State0),
+    case append_partial_transfer(Transfer, Payload, Link0) of
+        {ok, Link} ->
+            State = book_partial_transfer_received(update_link(Link, State0)),
+            {keep_state, State};
+        {error, {symbol, Reason} = Cond} ->
+            ?LOG_WARNING("amqp10_session: ending session due to ~ts on link ~ts",
+                         [Reason, Link0#link.name]),
+            %% Notify the link owner now, as this peer may not reply to `end` either.
+            Detach = #'v1_0.detach'{handle = uint(Link0#link.output_handle),
+                                    closed = true,
+                                    error = #'v1_0.error'{condition = Cond}},
+            ok = notify_link_detached(Link0, Detach, State0),
+            State = update_link(Link0#link{partial_transfers = undefined}, State0),
+            ok = send_end(State, Cond),
+            {next_state, end_sent, State}
+    end;
 mapped(cast, {Transfer0 = #'v1_0.transfer'{handle = {uint, InHandle}},
               Payload0}, State0) ->
     {ok, #link{target = {pid, TargetPid},
@@ -740,9 +749,7 @@ send_transfer(Transfer0, {raw, Payload}, _FooterOpt, MaxMessageSize,
            % TODO: this does not take the extended header into account
            % see: 2.3
            MaxPayloadSize = OutMaxFrameSize - ?FRAME_HEADER_SIZE - TransferSize,
-           Frames = build_frames(Channel, Transfer, Payload, MaxPayloadSize, []),
-           ok = socket_send(Socket, Frames),
-           {ok, length(Frames)}
+           send_frames(Socket, Channel, Transfer, Payload, MaxPayloadSize)
     end;
 send_transfer(Transfer0, Sections0, FooterOpt, MaxMessageSize,
               #state{socket = Socket,
@@ -761,9 +768,7 @@ send_transfer(Transfer0, Sections0, FooterOpt, MaxMessageSize,
            % TODO: this does not take the extended header into account
            % see: 2.3
            MaxPayloadSize = OutMaxFrameSize - ?FRAME_HEADER_SIZE - TransferSize,
-           Frames = build_frames(Channel, Transfer, SectionsBin, MaxPayloadSize, []),
-           ok = socket_send(Socket, Frames),
-           {ok, length(Frames)}
+           send_frames(Socket, Channel, Transfer, SectionsBin, MaxPayloadSize)
     end.
 
 encode_sections(Sections, undefined) ->
@@ -855,6 +860,14 @@ set_flow_session_fields(Flow, #state{next_incoming_id = NID,
            incoming_window = uint(max(0, IW)),
            next_outgoing_id = uint(NOI),
            outgoing_window = ?UINT_OUTGOING_WINDOW}.
+
+send_frames(_Socket, _Channel, _Transfer, _Payload, MaxPayloadSize)
+  when MaxPayloadSize =< 0 ->
+    {error, frame_size_too_small};
+send_frames(Socket, Channel, Transfer, Payload, MaxPayloadSize) ->
+    Frames = build_frames(Channel, Transfer, Payload, MaxPayloadSize, []),
+    ok = socket_send(Socket, Frames),
+    {ok, length(Frames)}.
 
 build_frames(Channel, Trf, Bin, MaxPayloadSize, Acc)
   when byte_size(Bin) =< MaxPayloadSize ->
@@ -1405,18 +1418,28 @@ book_link_transfer_send(Link = #link{link_credit = LC,
     Link#link{link_credit = LC - 1,
               delivery_count = add(DC, 1)}.
 
+append_partial_transfer(_Transfer, _Payload, #link{role = sender}) ->
+    {error, ?V_1_0_AMQP_ERROR_NOT_ALLOWED};
 append_partial_transfer(Transfer, Payload,
                         #link{partial_transfers = undefined} = Link) ->
-    Link#link{partial_transfers = {Transfer, [Payload]}};
+    append_partial_transfer(Transfer, Payload,
+                            Link#link{partial_transfers = {Transfer, [], 0}});
 append_partial_transfer(_Transfer, Payload,
-                        #link{partial_transfers = {T, Payloads}} = Link) ->
-    Link#link{partial_transfers = {T, [Payload | Payloads]}}.
+                        #link{partial_transfers = {T, Payloads, Size0},
+                              max_message_size = MaxMessageSize} = Link) ->
+    Size = Size0 + byte_size(Payload),
+    if is_integer(MaxMessageSize) andalso
+       Size > MaxMessageSize ->
+           {error, ?V_1_0_LINK_ERROR_MESSAGE_SIZE_EXCEEDED};
+       true ->
+           {ok, Link#link{partial_transfers = {T, [Payload | Payloads], Size}}}
+    end.
 
 complete_partial_transfer(Transfer, Payload,
                           #link{partial_transfers = undefined} = Link) ->
     {Transfer, Payload, Link};
 complete_partial_transfer(_Transfer, Payload,
-                          #link{partial_transfers = {T, Payloads}} = Link) ->
+                          #link{partial_transfers = {T, Payloads, _Size}} = Link) ->
     {T, iolist_to_binary(lists:reverse([Payload | Payloads])),
      Link#link{partial_transfers = undefined}}.
 
@@ -1574,7 +1597,7 @@ format_status(Status = #{data := Data0}) ->
                       PartialTransfers = case PartialTransfers0 of
                                              undefined ->
                                                  0;
-                                             {#'v1_0.transfer'{}, Binaries} ->
+                                             {#'v1_0.transfer'{}, Binaries, _Size} ->
                                                  length(Binaries)
                                          end,
                       #{name => Name,
@@ -1620,6 +1643,12 @@ format_status(Status = #{data := Data0}) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("kernel/include/logger.hrl").
+
+send_frames_frame_size_too_small_test_() ->
+    [?_assertEqual({error, frame_size_too_small},
+                   send_frames(undefined, 1, #'v1_0.transfer'{},
+                               <<"payload">>, MaxPayloadSize))
+     || MaxPayloadSize <- [0, -1, -100]].
 
 handle_session_flow_test() ->
     % see spec section: 2.5.6 for logic

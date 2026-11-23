@@ -28,6 +28,7 @@
                                 http_get_no_auth/3,
                                 http_get_no_decode/5,
                                 http_put/4, http_put/6,
+                                http_post_with_content_type/4,
                                 http_post/4, http_post/6,
                                 http_post_json/4,
                                 http_upload_raw/8,
@@ -85,7 +86,8 @@ some_tests() ->
         queues_test,
         bindings_test,
         policy_test,
-        policy_permissions_test
+        policy_permissions_test,
+        restricted_parameter_components_test
     ].
 
 definitions_group1_tests() ->
@@ -106,6 +108,7 @@ definitions_group2_tests() ->
 definitions_group3_tests() ->
     [
         definitions_server_named_queue_test,
+        definitions_queue_bindings_round_trip_test,
         definitions_with_charset_test,
         definitions_large_streamed_test
     ].
@@ -179,11 +182,14 @@ all_tests() -> [
     permissions_amqp_test,
     permissions_queue_delete_test,
     permissions_connection_channel_consumer_test,
+    connection_channel_name_reuse_test,
     consumers_cq_test,
     consumers_qq_test,
     consumers_require_virtual_host_access_test,
     arguments_test,
     arguments_table_test,
+    binary_fields_listing_test,
+    non_utf8_names_test,
     queue_purge_test,
     queue_actions_test,
     exclusive_consumer_test,
@@ -201,6 +207,8 @@ all_tests() -> [
     format_output_test,
     columns_test,
     get_test,
+    get_invalid_count_test,
+    get_payload_limit_test,
     get_encoding_test,
     get_fail_test,
     publish_test,
@@ -213,15 +221,21 @@ all_tests() -> [
     publish_fail_test,
     publish_base64_test,
     publish_unrouted_test,
+    publish_memory_alarm_test,
+    publish_disk_alarm_test,
     publish_confirm_timeout_test,
     if_empty_unused_test,
     parameters_test,
     global_parameters_test,
+    global_parameters_cluster_identity_test,
+    global_parameters_names_test,
     disabled_operator_policy_test,
     operator_policy_test,
     issue67_test,
     extensions_test,
     cors_test,
+    cross_site_state_change_test,
+    post_requires_json_content_type_test,
     vhost_limits_list_test,
     vhost_limit_set_test,
     rates_test,
@@ -362,6 +376,10 @@ end_per_testcase0(T, Config)
     Config;
 end_per_testcase0(definitions_password_test, Config) ->
     rpc(Config, application, unset_env, [rabbit, password_hashing_module]),
+    Config;
+end_per_testcase0(definitions_queue_bindings_round_trip_test, Config) ->
+    rpc(Config, rabbit_amqqueue, delete_with,
+        [rabbit_misc:r(<<"/">>, queue, <<"definitions-regular-q">>), false, false, <<"CT tests">>]),
     Config;
 end_per_testcase0(queues_test, Config) ->
     rabbit_ct_broker_helpers:delete_vhost(Config, <<"downvhost">>),
@@ -2102,6 +2120,20 @@ permissions_connection_channel_consumer_test(Config) ->
     AssertRead(MonConnCh, ?NOT_AUTHORISED),
     AssertRead(AdmConnCh, ?NOT_AUTHORISED),
 
+    %% Computing the samples for such a range crashes the pool worker, so
+    %% the object must not be looked up for a client that has not logged in.
+    TooLarge = "1" ++ lists:duplicate(306, $0),
+    Range = "?data_rates_age=" ++ TooLarge ++ "&data_rates_incr=" ++ TooLarge,
+    Workers = rabbit_ct_broker_helpers:rpc(Config, 0, supervisor, which_children,
+                                           [management_worker_pool_sup]),
+    [http_get(Config, P ++ Range, "user", "wrong password", ?NOT_AUTHORISED)
+     || P <- [UserConn, UserCh, UserConnCh]],
+    ?assertEqual(Workers,
+                 rabbit_ct_broker_helpers:rpc(Config, 0, supervisor, which_children,
+                                              [management_worker_pool_sup])),
+    http_get(Config, UserConnCh ++ "?disable_stats=true&msg_rates_age=60&msg_rates_incr=0",
+             "user", "user", ?BAD_REQUEST),
+
     AssertClose = fun(Path, User, Status) ->
                           http_delete(Config, Path, User, User, Status)
                   end,
@@ -2111,12 +2143,85 @@ permissions_connection_channel_consumer_test(Config) ->
     AssertClose(MonConn, "guest", {group, '2xx'}),
     AssertClose(UserConn, "user", {group, '2xx'}),
 
+    %% A missing object gets the same response as one of another user.
+    [http_get(Config, Path, "user", "user", ?NOT_AUTHORISED) ||
+        Path <- ["/connections/foo", "/connections/foo/channels",
+                 "/connections/foo/sessions", "/channels/foo"]],
+    AssertClose("/connections/foo", "user", ?NOT_AUTHORISED),
+    AssertClose("/connections/foo", "monitor", ?NOT_AUTHORISED),
+
     http_delete(Config, "/users/user", {group, '2xx'}),
     http_delete(Config, "/users/monitor", {group, '2xx'}),
     http_get(Config, "/connections/foo", ?NOT_FOUND),
+    http_get(Config, "/connections/foo/channels", ?NOT_FOUND),
     http_get(Config, "/channels/foo", ?NOT_FOUND),
     http_delete(Config, "/queues/%2F/test", {group, '2xx'}),
     passed.
+
+%% A connection name only consists of addresses and ports, so it can pass to a
+%% connection of another user while a request is served. What is returned or
+%% closed must be what the user was authorised for.
+connection_channel_name_reuse_test(Config) ->
+    http_put(Config, "/users/user", [{password, <<"user">>},
+                                     {tags, <<"management">>}], {group, '2xx'}),
+    http_put(Config, "/permissions/%2F/user",
+             [{configure, <<".*">>}, {write, <<".*">>}, {read, <<".*">>}],
+             {group, '2xx'}),
+    {UserConn, UserConnPath, UserChPath, _} = get_conn(Config, "user", "user"),
+    {AdmConn, AdmConnPath, AdmChPath, _} = get_conn(Config, "guest", "guest"),
+    {ok, _} = amqp_connection:open_channel(UserConn),
+    {ok, _} = amqp_connection:open_channel(AdmConn),
+    await_condition(
+      fun () ->
+              [http_get(Config, P, ?OK) ||
+                  P <- [UserConnPath, UserChPath, AdmConnPath, AdmChPath]],
+              true
+      end),
+    #{name := AdmConnName} = http_get(Config, AdmConnPath, ?OK),
+    #{name := AdmChName} = http_get(Config, AdmChPath, ?OK),
+
+    ok = rpc(Config, meck, new, [rabbit_mgmt_db, [passthrough, no_link]]),
+    try
+        ok = rpc(Config, ?MODULE, reuse_name_after_first_lookup,
+                 [get_connection, AdmConnName]),
+        ?assertMatch(#{user := <<"user">>},
+                     http_get(Config, UserConnPath, "user", "user", ?OK)),
+        ok = rpc(Config, ?MODULE, reuse_name_after_first_lookup,
+                 [get_channel, AdmChName]),
+        ?assertMatch(#{user := <<"user">>},
+                     http_get(Config, UserChPath, "user", "user", ?OK)),
+        %% With stats disabled, the connection is looked up again.
+        ok = rpc(Config, ?MODULE, reuse_name_with_stats_disabled, [AdmConnName]),
+        http_get(Config, UserConnPath ++ "?disable_stats=true", "user", "user",
+                 ?NOT_FOUND),
+        ok = rpc(Config, ?MODULE, reuse_name_after_first_lookup,
+                 [get_connection, AdmConnName]),
+        MRef = erlang:monitor(process, UserConn),
+        http_delete(Config, UserConnPath, "user", "user", {group, '2xx'}),
+        receive {'DOWN', MRef, process, UserConn, _} -> ok
+        after 30000 -> ct:fail(connection_not_closed)
+        end
+    after
+        rpc(Config, meck, unload, [rabbit_mgmt_db])
+    end,
+    http_get(Config, AdmConnPath, ?OK),
+    ?assert(is_process_alive(AdmConn)),
+
+    close_connection(AdmConn),
+    http_delete(Config, "/users/user", {group, '2xx'}),
+    passed.
+
+reuse_name_with_stats_disabled(Name) ->
+    meck:expect(rabbit_mgmt_db, get_connection, 1,
+                meck:exec(fun(_) -> meck:passthrough([Name]) end)).
+
+%% From the second lookup on, any name designates the object called Name.
+reuse_name_after_first_lookup(Lookup, Name) ->
+    meck:expect(rabbit_mgmt_db, Lookup, 2,
+                meck:seq([meck:passthrough(),
+                          meck:exec(fun(_, Ranges) ->
+                                            meck:passthrough([Name, Ranges])
+                                    end)])).
 
 consumers_cq_test(Config) ->
     consumers_test(Config, [{'x-queue-type', <<"classic">>}]).
@@ -2775,6 +2880,42 @@ definitions_server_named_queue_test(Config) ->
     http_get(Config, Path, ?NOT_FOUND),
     passed.
 
+definitions_queue_bindings_round_trip_test(Config) ->
+    {Conn, Ch} = open_connection_and_channel(Config),
+    ExclusiveQ = <<"definitions-exclusive-q">>,
+    RegularQ = <<"definitions-regular-q">>,
+    #'queue.declare_ok'{} =
+        amqp_channel:call(Ch, #'queue.declare'{queue = ExclusiveQ, exclusive = true}),
+    #'queue.declare_ok'{queue = ServerNamedQ} =
+        amqp_channel:call(Ch, #'queue.declare'{queue = <<"">>, durable = true}),
+    #'queue.declare_ok'{} =
+        amqp_channel:call(Ch, #'queue.declare'{queue = RegularQ, durable = true}),
+    [#'queue.bind_ok'{} =
+         amqp_channel:call(Ch, #'queue.bind'{queue = Q, exchange = <<"amq.direct">>,
+                                             routing_key = <<"definitions-test">>})
+     || Q <- [ExclusiveQ, ServerNamedQ, RegularQ]],
+
+    Expected = lists:sort([ServerNamedQ, RegularQ]),
+    Definitions = http_get(Config, "/definitions", ?OK),
+    ?assertEqual(Expected, amq_direct_binding_destinations(Definitions)),
+    ?assertEqual(Expected, amq_direct_binding_destinations(http_get(Config, "/definitions/%2F", ?OK))),
+    close_channel(Ch),
+    close_connection(Conn),
+
+    ServerNamedPath = "/queues/%2F/" ++ rabbit_http_util:quote_plus(ServerNamedQ),
+    RegularPath = "/queues/%2F/" ++ binary_to_list(RegularQ),
+    http_delete(Config, ServerNamedPath, {group, '2xx'}),
+    http_delete(Config, RegularPath, {group, '2xx'}),
+    http_post(Config, "/definitions", Definitions, {group, '2xx'}),
+    http_get(Config, ServerNamedPath, ?NOT_FOUND),
+    [_] = http_get(Config, "/bindings/%2F/e/amq.direct/q/" ++ binary_to_list(RegularQ), ?OK),
+    passed.
+
+amq_direct_binding_destinations(Definitions) ->
+    lists:sort([D || #{source := <<"amq.direct">>,
+                       routing_key := <<"definitions-test">>,
+                       destination := D} <- maps:get(bindings, Definitions)]).
+
 definitions_with_charset_test(Config) ->
     Path = "/definitions",
     Body0 = http_get(Config, Path, ?OK),
@@ -2828,6 +2969,66 @@ arguments_table_test(Config) ->
     http_put(Config, "/exchanges/%2F/arguments-table-test-x", XArgs, {group, '2xx'}),
     Args = maps:get(arguments, http_get(Config, "/exchanges/%2F/arguments-table-test-x", ?OK)),
     http_delete(Config, "/exchanges/%2F/arguments-table-test-x", {group, '2xx'}),
+    passed.
+
+binary_fields_listing_test(Config) ->
+    {Conn, Ch} = open_connection_and_channel(Config),
+    Args = [{<<255>>, longstr, <<"v">>},
+            {<<"t">>, table, [{<<254>>, long, 1}]}],
+    QName = <<"binary-fields-q">>,
+    XName = <<"binary-fields-x">>,
+    #'queue.declare_ok'{} =
+        amqp_channel:call(Ch, #'queue.declare'{queue = QName, durable = true, arguments = Args}),
+    #'exchange.declare_ok'{} =
+        amqp_channel:call(Ch, #'exchange.declare'{exchange = XName,
+                                                  type = <<"headers">>,
+                                                  arguments = Args}),
+    #'queue.bind_ok'{} =
+        amqp_channel:call(Ch, #'queue.bind'{queue = QName,
+                                            exchange = XName,
+                                            arguments = Args}),
+    #'basic.consume_ok'{} =
+        amqp_channel:call(Ch, #'basic.consume'{queue = QName,
+                                               consumer_tag = <<"binary-fields-c">>,
+                                               arguments = Args}),
+    amqp_channel:call(Ch, #'basic.publish'{exchange = <<>>, routing_key = QName},
+                      #amqp_msg{props = #'P_basic'{headers = Args},
+                                payload = <<"m">>}),
+    await_condition(
+      fun() ->
+              [_] = http_get(Config, "/consumers/%2F", ?OK),
+              true
+      end),
+    http_get(Config, "/queues", ?OK),
+    http_get(Config, "/queues/%2F", ?OK),
+    http_get(Config, "/queues/%2F/binary-fields-q", ?OK),
+    http_get(Config, "/exchanges", ?OK),
+    http_get(Config, "/exchanges/%2F/binary-fields-x", ?OK),
+    http_get(Config, "/bindings", ?OK),
+    http_get(Config, "/bindings/%2F", ?OK),
+    http_get(Config, "/consumers", ?OK),
+    http_get(Config, "/definitions", ?OK),
+    http_post(Config, "/queues/%2F/binary-fields-q/get",
+              #{count => 1, ackmode => <<"ack_requeue_true">>,
+                encoding => <<"auto">>}, ?OK),
+    amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    amqp_channel:call(Ch, #'exchange.delete'{exchange = XName}),
+    close_channel(Ch),
+    close_connection(Conn),
+    passed.
+
+non_utf8_names_test(Config) ->
+    http_put(Config, "/queues/%2F/%FF", #{durable => true}, ?BAD_REQUEST),
+    http_put(Config, "/exchanges/%2F/%FF", #{type => <<"direct">>}, ?BAD_REQUEST),
+    http_get(Config, "/queues", ?OK),
+    http_get(Config, "/exchanges", ?OK),
+
+    QName = rabbit_misc:r(<<"/">>, queue, <<255>>),
+    {new, _} = rabbit_ct_broker_helpers:rpc(
+                 Config, 0, rabbit_amqqueue, declare,
+                 [QName, true, false, [], none, <<"guest">>]),
+    http_delete(Config, "/queues/%2F/%FF", {group, '2xx'}),
+    http_get(Config, "/queues", ?OK),
     passed.
 
 queue_purge_test(Config) ->
@@ -3576,6 +3777,52 @@ get_test(Config) ->
 
     passed.
 
+get_invalid_count_test(Config) ->
+    http_put(Config, "/queues/%2F/get_count_test", #{durable => true}, {group, '2xx'}),
+    {Conn, Ch} = open_connection_and_channel(Config),
+    amqp_channel:cast(Ch, #'basic.publish'{exchange = <<>>,
+                                           routing_key = <<"get_count_test">>},
+                      #amqp_msg{payload = <<"abc">>}),
+    Get = fun(Count, Expected) ->
+                  http_post(Config, "/queues/%2F/get_count_test/get",
+                            [{ackmode, ack_requeue_true}, {count, Count},
+                             {encoding, auto}], Expected)
+          end,
+    Get(0, ?BAD_REQUEST),
+    Get(-1, ?BAD_REQUEST),
+    Get(1001, ?BAD_REQUEST),
+    [_] = Get(1, ?OK),
+    [_] = Get(1000, ?OK),
+    http_delete(Config, "/queues/%2F/get_count_test", {group, '2xx'}),
+    amqp_channel:close(Ch),
+    close_connection(Conn),
+    passed.
+
+get_payload_limit_test(Config) ->
+    Key = basic_get_max_payload_bytes,
+    http_put(Config, "/queues/%2F/get_limit_test", #{durable => true}, {group, '2xx'}),
+    {Conn, Ch} = open_connection_and_channel(Config),
+    [amqp_channel:cast(Ch, #'basic.publish'{exchange = <<>>,
+                                            routing_key = <<"get_limit_test">>},
+                       #amqp_msg{payload = <<"0123456789">>})
+     || _ <- lists:seq(1, 5)],
+    ok = rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env,
+                                      [rabbitmq_management, Key, 25]),
+    Msgs = http_post(Config, "/queues/%2F/get_limit_test/get",
+                     [{ackmode, ack_requeue_true}, {count, 5},
+                      {encoding, auto}, {truncate, 3}], ?OK),
+    3 = length(Msgs),
+    [<<"012">>, <<"012">>, <<"012">>] = [maps:get(payload, M) || M <- Msgs],
+    ok = rabbit_ct_broker_helpers:rpc(Config, 0, application, unset_env,
+                                      [rabbitmq_management, Key]),
+    5 = length(http_post(Config, "/queues/%2F/get_limit_test/get",
+                         [{ackmode, ack_requeue_false}, {count, 5},
+                          {encoding, auto}], ?OK)),
+    http_delete(Config, "/queues/%2F/get_limit_test", {group, '2xx'}),
+    amqp_channel:close(Ch),
+    close_connection(Conn),
+    passed.
+
 get_encoding_test(Config) ->
     Utf8Text = <<"Loïc was here!"/utf8>>,
     Utf8Payload = base64:encode(Utf8Text),
@@ -3863,6 +4110,32 @@ publish_unrouted_test(Config) ->
     ?assertEqual(#{routed => false},
                  http_post(Config, "/exchanges/%2F/amq.default/publish", Msg, ?OK)).
 
+publish_memory_alarm_test(Config) ->
+    publish_resource_alarm_test(Config, memory).
+
+publish_disk_alarm_test(Config) ->
+    publish_resource_alarm_test(Config, disk).
+
+publish_resource_alarm_test(Config, Resource) ->
+    QName = atom_to_binary(Resource),
+    Path = "/queues/%2F/" ++ atom_to_list(Resource),
+    Msg = msg(QName, #{}, <<"Hello world">>),
+    Get = [{ackmode, ack_requeue_false}, {count, 1}, {encoding, auto}],
+    Node = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    http_put(Config, Path, #{durable => true}, {group, '2xx'}),
+    try
+        ok = rabbit_ct_broker_helpers:set_alarm(Config, Node, Resource),
+        http_post(Config, "/exchanges/%2F/amq.default/publish", Msg, 503),
+        ok = rabbit_ct_broker_helpers:clear_alarm(Config, Node, Resource),
+        ?assertEqual([], http_post(Config, Path ++ "/get", Get, ?OK)),
+        ?assertEqual(#{routed => true},
+                     http_post(Config, "/exchanges/%2F/amq.default/publish", Msg, ?OK)),
+        ?assertMatch([_], http_post(Config, Path ++ "/get", Get, ?OK))
+    after
+        rabbit_ct_broker_helpers:clear_alarm(Config, Node, Resource),
+        http_delete(Config, Path, {group, '2xx'})
+    end.
+
 publish_confirm_timeout_test(Config) ->
     QName = <<"publish_confirm_timeout_test">>,
     Path = "/queues/%2F/publish_confirm_timeout_test",
@@ -3965,6 +4238,72 @@ global_parameters_test(Config) ->
     InitialCount = length(http_get(Config, "/global-parameters")),
     passed.
 
+global_parameters_cluster_identity_test(Config) ->
+    http_put(Config, "/users/policy-admin", [{password, <<"secret">>},
+                                             {tags, <<"policymaker">>}], {group, '2xx'}),
+    OriginalName = http_get(Config, "/global-parameters/cluster_name", ?OK),
+    OriginalId = http_get(Config, "/global-parameters/internal_cluster_id", ?OK),
+
+    http_put(Config, "/global-parameters/cluster_name",
+             [{value, <<"rabbit@evil">>}], "policy-admin", "secret", ?NOT_AUTHORISED),
+    http_put(Config, "/global-parameters/internal_cluster_id",
+             [{value, <<"rabbitmq-cluster-id-0000">>}], "policy-admin", "secret", ?NOT_AUTHORISED),
+    http_delete(Config, "/global-parameters/cluster_name",
+                "policy-admin", "secret", ?NOT_AUTHORISED),
+    http_delete(Config, "/global-parameters/internal_cluster_id",
+                "policy-admin", "secret", ?NOT_AUTHORISED),
+    ?assertEqual(OriginalName, http_get(Config, "/global-parameters/cluster_name", ?OK)),
+    ?assertEqual(OriginalId, http_get(Config, "/global-parameters/internal_cluster_id", ?OK)),
+
+    http_put(Config, "/global-parameters/ops_notes",
+             [{value, [{owner, <<"platform-team">>}]}], "policy-admin", "secret", {group, '2xx'}),
+    http_delete(Config, "/global-parameters/ops_notes",
+                "policy-admin", "secret", {group, '2xx'}),
+
+    http_put(Config, "/global-parameters/cluster_name",
+             [{value, <<"rabbit@prod-east">>}], {group, '2xx'}),
+    #{value := <<"rabbit@prod-east">>} = http_get(Config, "/global-parameters/cluster_name", ?OK),
+    http_put(Config, "/cluster-name", [{name, <<"rabbit@prod-west">>}], {group, '2xx'}),
+    #{value := <<"rabbit@prod-west">>} = http_get(Config, "/global-parameters/cluster_name", ?OK),
+
+    http_delete(Config, "/global-parameters/internal_cluster_id", ?BAD_REQUEST),
+    ?assertEqual(OriginalId, http_get(Config, "/global-parameters/internal_cluster_id", ?OK)),
+
+    http_put(Config, "/global-parameters/cluster_name",
+             [{value, maps:get(value, OriginalName)}], {group, '2xx'}),
+    http_delete(Config, "/users/policy-admin", {group, '2xx'}),
+    passed.
+
+global_parameters_names_test(Config) ->
+    http_put(Config, "/users/policy-admin", [{password, <<"secret">>},
+                                             {tags, <<"policymaker">>}], {group, '2xx'}),
+    OriginalTags = http_get(Config, "/global-parameters/cluster_tags", ?OK),
+    Params = [{"imported_definition_hash_value", <<"0123456789abcdef">>},
+              {"mqtt_port_to_vhost_mapping", [{<<"1883">>, <<"/">>}]},
+              {"mqtt_default_vhosts", [{<<"CN=client">>, <<"/">>}]},
+              {"cluster_tags", [{<<"region">>, <<"eu">>}]}],
+    lists:foreach(
+      fun({Name, Value}) ->
+              Path = "/global-parameters/" ++ Name,
+              http_put(Config, Path, [{value, Value}], "policy-admin", "secret", ?NOT_AUTHORISED),
+              http_delete(Config, Path, "policy-admin", "secret", ?NOT_AUTHORISED),
+              http_put(Config, Path, [{value, Value}], {group, '2xx'}),
+              http_delete(Config, Path, "policy-admin", "secret", ?NOT_AUTHORISED),
+              #{value := _} = http_get(Config, Path, ?OK),
+              http_delete(Config, Path, {group, '2xx'}),
+              http_get(Config, Path, ?NOT_FOUND)
+      end, Params),
+    http_put(Config, "/global-parameters/cluster_tags",
+             [{value, maps:get(value, OriginalTags)}], {group, '2xx'}),
+
+    http_put(Config, "/global-parameters/ops_notes",
+             [{value, [{owner, <<"platform-team">>}]}], "policy-admin", "secret", {group, '2xx'}),
+    http_delete(Config, "/global-parameters/ops_notes",
+                "policy-admin", "secret", {group, '2xx'}),
+
+    http_delete(Config, "/users/policy-admin", {group, '2xx'}),
+    passed.
+
 operator_policy_test(Config) ->
     register_parameters_and_policy_validator(Config),
     PolicyPos  = #{vhost      => <<"/">>,
@@ -4014,6 +4353,27 @@ disabled_operator_policy_test(Config) ->
                    priority   => 10},
     http_put(Config, "/operator-policies/%2F/policy_pos", PolicyPos, ?METHOD_NOT_ALLOWED),
     http_delete(Config, "/operator-policies/%2F/policy_pos", ?METHOD_NOT_ALLOWED),
+    %% The runtime parameter component is `operator_policy`, the HTTP API path is `/operator-policies`.
+    OpPolicyParam = #{value => #{pattern    => <<".*">>,
+                                 definition => #{<<"max-length">> => 10},
+                                 priority   => 0,
+                                 'apply-to' => <<"queues">>}},
+    http_put(Config, "/parameters/operator_policy/%2F/policy_pos",
+             OpPolicyParam, ?METHOD_NOT_ALLOWED),
+    http_delete(Config, "/parameters/operator_policy/%2F/policy_pos",
+                ?METHOD_NOT_ALLOWED),
+    rabbit_ct_broker_helpers:set_operator_policy(
+      Config, 0, <<"policy_pos">>, <<".*">>, <<"queues">>, [{<<"max-length">>, 10}]),
+    http_get(Config, "/parameters/operator_policy/%2F/policy_pos", ?OK),
+    http_delete(Config, "/parameters/operator_policy/%2F/policy_pos",
+                ?METHOD_NOT_ALLOWED),
+    rabbit_ct_broker_helpers:clear_operator_policy(Config, 0, <<"policy_pos">>),
+
+    LimitsPath = "/parameters/vhost-limits/%2F/limits",
+    http_put(Config, LimitsPath, #{value => #{<<"max-queues">> => 10}}, {group, '2xx'}),
+    http_get(Config, LimitsPath, ?OK),
+    http_delete(Config, LimitsPath, {group, '2xx'}),
+    http_get(Config, LimitsPath, ?NOT_FOUND),
     0 = length(http_get(Config, "/operator-policies",     ?OK)),
     0 = length(http_get(Config, "/operator-policies/%2F", ?OK)),
     unregister_parameters_and_policy_validator(Config),
@@ -4151,6 +4511,51 @@ policy_permissions_test(Config) ->
     unregister_parameters_and_policy_validator(Config),
     passed.
 
+restricted_parameter_components_test(Config) ->
+    register_parameters_and_policy_validator(Config),
+    http_put(Config, "/users/policy", [{password, <<"policy">>},
+                                       {tags, <<"policymaker">>}], {group, '2xx'}),
+    http_put(Config, "/vhosts/v", none, {group, '2xx'}),
+    http_put(Config, "/permissions/v/policy", [{configure, <<".*">>},
+                                               {write,     <<".*">>},
+                                               {read,      <<".*">>}], {group, '2xx'}),
+    OpPolicy = #{value => #{pattern    => <<".*">>,
+                            definition => #{<<"max-length">> => 10},
+                            priority   => 0,
+                            'apply-to' => <<"queues">>}},
+    Limits = #{value => #{<<"max-queues">> => 10}},
+    %% The runtime parameter component is `operator_policy`, the HTTP API path is `/operator-policies`.
+    OpPolicyPath = "/parameters/operator_policy/v/op",
+    LimitsPath = "/parameters/vhost-limits/v/limits",
+
+    http_put(Config, OpPolicyPath, OpPolicy, "policy", "policy", ?NOT_AUTHORISED),
+    http_put(Config, LimitsPath, Limits, "policy", "policy", ?NOT_AUTHORISED),
+    [] = http_get(Config, "/operator-policies/v"),
+    [] = http_get(Config, "/vhost-limits/v"),
+
+    http_put(Config, OpPolicyPath, OpPolicy, {group, '2xx'}),
+    http_put(Config, LimitsPath, Limits, {group, '2xx'}),
+    http_get(Config, OpPolicyPath, "policy", "policy", ?OK),
+    http_get(Config, LimitsPath, "policy", "policy", ?OK),
+    http_delete(Config, OpPolicyPath, "policy", "policy", ?NOT_AUTHORISED),
+    http_delete(Config, LimitsPath, "policy", "policy", ?NOT_AUTHORISED),
+    http_get(Config, OpPolicyPath, ?OK),
+    http_get(Config, LimitsPath, ?OK),
+
+    http_put(Config, "/parameters/test/v/good", [{value, <<"">>}],
+             "policy", "policy", {group, '2xx'}),
+    http_delete(Config, "/parameters/test/v/good", "policy", "policy", {group, '2xx'}),
+
+    http_delete(Config, OpPolicyPath, {group, '2xx'}),
+    http_delete(Config, LimitsPath, {group, '2xx'}),
+    [] = http_get(Config, "/operator-policies/v"),
+    [] = http_get(Config, "/vhost-limits/v"),
+
+    http_delete(Config, "/vhosts/v", {group, '2xx'}),
+    http_delete(Config, "/users/policy", {group, '2xx'}),
+    unregister_parameters_and_policy_validator(Config),
+    passed.
+
 issue67_test(Config)->
     {ok, {{_, 401, _}, Headers, _}} = req(Config, get, "/queues",
                                           [auth_header("user_no_access", "password_no_access")]),
@@ -4217,6 +4622,134 @@ cors_test(Config) ->
     check_cors_all_endpoints(Config),
     %% Disable CORS again.
     rpc(Config, application, set_env, [rabbitmq_management, cors_allow_origins, []]),
+    passed.
+
+cross_site_state_change_test(Config) ->
+    Auth = auth_header("guest", "guest"),
+    Boundary = "----rmq-test-boundary",
+    Definitions = "{\"users\":[{\"name\":\"cross_site_user\","
+                  "\"password\":\"s3kRe7\",\"tags\":\"administrator\"}]}",
+    Body = "--" ++ Boundary ++ "\r\n"
+           "Content-Disposition: form-data; name=\"file\"; filename=\"definitions.json\"\r\n"
+           "Content-Type: application/json\r\n\r\n" ++
+           Definitions ++ "\r\n--" ++ Boundary ++ "--\r\n",
+    ContentType = {"content-type", "multipart/form-data; boundary=" ++ Boundary},
+    Import = fun(Headers) ->
+                     {ok, {{_, Code, _}, _, RespBody}} =
+                         req(Config, 0, post, "/definitions",
+                             [Auth, ContentType | Headers], Body),
+                     {Code, RespBody}
+             end,
+    UserExists = fun() ->
+                         {ok, {{_, Code, _}, _, _}} =
+                             req(Config, get, "/users/cross_site_user", [Auth]),
+                         Code =:= ?OK
+                 end,
+
+    lists:foreach(
+      fun(Headers) ->
+              {403, RespBody} = Import(Headers),
+              #{<<"error">> := <<"forbidden">>,
+                <<"reason">> := <<"HTTP access denied: cross-site request">>} =
+                  rabbit_json:decode(rabbit_data_coercion:to_binary(RespBody)),
+              ?assertNot(UserExists())
+      end,
+      [[{"sec-fetch-site", "cross-site"}, {"origin", "https://example.com"}],
+       [{"sec-fetch-site", "same-site"}, {"origin", "https://example.com"}],
+       [{"sec-fetch-site", "cross-site"}]]),
+
+    {?NO_CONTENT, _} = Import([{"sec-fetch-site", "same-origin"}]),
+    ?assert(UserExists()),
+    http_delete(Config, "/users/cross_site_user", ?NO_CONTENT),
+
+    {ok, {{_, ?OK, _}, _, _}} =
+        req(Config, get, "/overview", [Auth, {"sec-fetch-site", "cross-site"}]),
+
+    rpc(Config, application, set_env,
+        [rabbitmq_management, cors_allow_origins, ["https://rabbitmq.com"]]),
+    {403, _} = Import([{"sec-fetch-site", "cross-site"},
+                       {"origin", "https://example.com"}]),
+    ?assertNot(UserExists()),
+    {?NO_CONTENT, _} = Import([{"sec-fetch-site", "cross-site"},
+                               {"origin", "https://rabbitmq.com"}]),
+    http_delete(Config, "/users/cross_site_user", ?NO_CONTENT),
+
+    rpc(Config, application, set_env,
+        [rabbitmq_management, cors_allow_origins, ["*"]]),
+    {?NO_CONTENT, _} = Import([{"sec-fetch-site", "cross-site"},
+                               {"origin", "https://example.com"}]),
+    http_delete(Config, "/users/cross_site_user", ?NO_CONTENT),
+    rpc(Config, application, set_env,
+        [rabbitmq_management, cors_allow_origins, []]),
+    passed.
+
+post_requires_json_content_type_test(Config) ->
+    http_put(Config, "/exchanges/%2F/orders", #{type => <<"topic">>, durable => true},
+             {group, '2xx'}),
+    http_put(Config, "/queues/%2F/orders.fulfilment", #{durable => true},
+             {group, '2xx'}),
+    [http_put(Config, "/users/" ++ U, #{password => <<"s3kRe7">>, tags => <<"">>},
+              {group, '2xx'})
+     || U <- ["ci-runner", "legacy-billing"]],
+    BindingPath = "/bindings/%2F/e/orders/q/orders.fulfilment",
+    BindingBody = "{\"routing_key\":\"orders.created\",\"arguments\":{}}",
+    ActionsPath = "/queues/%2F/orders.fulfilment/actions",
+    ActionsBody = "{\"action\":\"sync\"}",
+    BulkDeletePath = "/users/bulk-delete",
+    BulkDeleteBody = "{\"users\":[\"ci-runner\",\"legacy-billing\"]}",
+    lists:foreach(
+      fun({Path, Body}) ->
+              [?assertEqual({Path, ContentType, 415},
+                            {Path, ContentType,
+                             http_post_with_content_type(Config, Path, ContentType, Body)})
+               || ContentType <- ["text/plain",
+                                  "application/x-www-form-urlencoded",
+                                  "multipart/form-data; boundary=x",
+                                  "",
+                                  none]]
+      end,
+      [{BindingPath, BindingBody},
+       {ActionsPath, ActionsBody},
+       {BulkDeletePath, BulkDeleteBody}]),
+    [] = http_get(Config, BindingPath, ?OK),
+    http_get(Config, "/users/ci-runner", ?OK),
+    http_get(Config, "/users/legacy-billing", ?OK),
+
+    ?CREATED = http_post_with_content_type(Config, BindingPath,
+                                           "application/json; charset=utf-8",
+                                           BindingBody),
+    [#{routing_key := <<"orders.created">>}] = http_get(Config, BindingPath, ?OK),
+
+    PublishPath = "/exchanges/%2F/orders/publish",
+    PublishBody = "{\"properties\":{\"content_type\":\"application/json\"},"
+                  "\"routing_key\":\"orders.created\","
+                  "\"payload\":\"{\\\"order_id\\\":1042}\",\"payload_encoding\":\"string\"}",
+    GetPath = "/queues/%2F/orders.fulfilment/get",
+    GetBody = "{\"count\":1,\"ackmode\":\"ack_requeue_false\",\"encoding\":\"auto\"}",
+    [?assertEqual({Path, ContentType, 415},
+                  {Path, ContentType,
+                   http_post_with_content_type(Config, Path, ContentType, Body)})
+     || {Path, Body} <- [{PublishPath, PublishBody}, {GetPath, GetBody}],
+        ContentType <- ["text/plain",
+                        "application/x-www-form-urlencoded",
+                        "multipart/form-data; boundary=x",
+                        "",
+                        none]],
+    [] = http_post_json(Config, GetPath, GetBody, ?OK),
+    #{routed := true} = http_post_json(Config, PublishPath, PublishBody, ?OK),
+    [#{payload := <<"{\"order_id\":1042}">>,
+       routing_key := <<"orders.created">>}] =
+        http_post_json(Config, GetPath, GetBody, ?OK),
+    %% No queue actions remain, so a well-formed request is rejected by the handler.
+    ?BAD_REQUEST = http_post_with_content_type(Config, ActionsPath,
+                                               "application/json", ActionsBody),
+    ?NO_CONTENT = http_post_with_content_type(Config, BulkDeletePath,
+                                              "application/json", BulkDeleteBody),
+    http_get(Config, "/users/ci-runner", ?NOT_FOUND),
+    http_get(Config, "/users/legacy-billing", ?NOT_FOUND),
+
+    http_delete(Config, "/queues/%2F/orders.fulfilment", {group, '2xx'}),
+    http_delete(Config, "/exchanges/%2F/orders", {group, '2xx'}),
     passed.
 
 check_cors_all_endpoints(Config) ->
@@ -4576,6 +5109,25 @@ login_test(Config) ->
             [{"content-type", "application/x-www-form-urlencoded"}],
             <<"username=misteryusernumber1&password=myuser">>),
     ?assert(not proplists:is_defined("set-cookie", Headers2)),
+
+    %% A crash report of the request process would log the credentials.
+    {ok, {{_, 400, _}, _, Body3}} =
+        req(Config, 0, post, "/login",
+            [{"content-type", "application/x-www-form-urlencoded"}],
+            <<"username=myuser&password=my&=user">>),
+    ?assertMatch(#{<<"error">> := <<"bad_request">>}, rabbit_json:decode(Body3)),
+    {ok, {{_, 400, _}, _, _}} =
+        httpc:request(post, {rabbit_mgmt_test_util:uri_base_from(Config, 0, "") ++ "login", [],
+                             "application/x-www-form-urlencoded",
+                             "access_token=root-login-marker&=x"}, [], []),
+    [ok = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_logger_std_h, filesync, [Id])
+     || #{id := Id, module := rabbit_logger_std_h}
+            <- rabbit_ct_broker_helpers:rpc(Config, 0, logger, get_handler_config, [])],
+    [begin
+         {ok, Log} = file:read_file(File),
+         ?assertEqual(nomatch, binary:match(Log, <<"root-login-marker">>))
+     end || File <- rabbit_ct_broker_helpers:get_node_config(Config, 0, log_locations),
+            filelib:is_regular(File)],
 
     http_delete(Config, "/users/myuser", {group, '2xx'}),
     passed.

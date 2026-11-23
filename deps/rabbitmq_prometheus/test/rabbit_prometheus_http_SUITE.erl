@@ -85,11 +85,12 @@ groups() ->
                                      queue_filter_delivery_metrics_test,
                                      queue_filter_queue_exchange_metrics_test,
                                      queue_filter_raft_metrics_test,
+                                     queue_filter_raft_metrics_match_limit_test,
                                      queue_filter_combined_with_vhost_test,
                                      queue_filter_multiple_patterns_rejected_test,
                                      queue_filter_empty_is_ignored_test
         ]},
-       {special_chars, [], [core_metrics_special_chars]},
+       {special_chars, [], [core_metrics_special_chars, exchange_metrics_special_chars]},
        {authentication, [], [basic_auth]}
     ].
 
@@ -525,6 +526,7 @@ memory_breakdown_metrics_test(Config) ->
 
 build_info_test(Config) ->
     {_Headers, Body} = http_get_with_pal(Config, [], 200),
+    ?assertEqual(match, re:run(Body, "^# TYPE rabbitmq_build_info gauge$", [{capture, none}, multiline])),
     ?assertEqual(match, re:run(Body, "^rabbitmq_build_info{", [{capture, none}, multiline])),
     ?assertEqual(match, re:run(Body, "rabbitmq_version=\"", [{capture, none}])),
     ?assertEqual(match, re:run(Body, "prometheus_plugin_version=\"", [{capture, none}])),
@@ -540,6 +542,7 @@ build_info_product_test(Config) ->
 
 identity_info_test(Config) ->
     {_Headers, Body} = http_get_with_pal(Config, [], 200),
+    ?assertEqual(match, re:run(Body, "^# TYPE rabbitmq_identity_info gauge$", [{capture, none}, multiline])),
     ?assertEqual(match, re:run(Body, "^rabbitmq_identity_info{", [{capture, none}, multiline])),
     ?assertEqual(match, re:run(Body, "rabbitmq_node=", [{capture, none}])),
     ?assertEqual(match, re:run(Body, "rabbitmq_cluster=", [{capture, none}])),
@@ -934,6 +937,20 @@ core_metrics_special_chars(Config) ->
                       maps:to_list(LabelValue3)),
     ok.
 
+exchange_metrics_special_chars(Config) ->
+    Labels = #{vhost => "vhost\\\"\\n\\\\",
+               exchange => "exchange\\\"\\\\",
+               type => "direct"},
+    lists:foreach(
+      fun({Family, Metric}) ->
+          {_, Body} = http_get_with_pal(Config,
+              "/metrics/detailed?family=" ++ Family, [], 200),
+          Values = maps:get(Metric, parse_response(Body)),
+          ?assertEqual([1], maps:get(Labels, Values))
+      end,
+      [{"exchange_names", rabbitmq_cluster_exchange_name},
+       {"exchange_bindings", rabbitmq_cluster_exchange_bindings}]).
+
 detailed_raft_metrics_test(Config) ->
     QQMetrics = #{#{queue => "a_quorum_queue", vhost => "/"} => ["1.0"]},
 
@@ -1025,6 +1042,13 @@ queue_filter_raft_metrics_test(Config) ->
     {_, Body2} = http_get_with_pal(Config, "/metrics/detailed?family=ra_metrics&queue=nonexistent", [], 200),
     ?assertEqual(undefined,
                  maps:get(rabbitmq_detailed_raft_term, parse_response(Body2), undefined)),
+    ok.
+
+queue_filter_raft_metrics_match_limit_test(Config) ->
+    %% `^(.|.)*(.|.)*_queue$` matches `a_quorum_queue` only with a match limit above 2000.
+    {_, Body} = http_get_with_pal(Config, "/metrics/detailed?family=ra_metrics&queue=%5E(.%7C.)*(.%7C.)*_queue%24", [], 200),
+    ?assertEqual(undefined,
+                 maps:get(rabbitmq_detailed_raft_term, parse_response(Body), undefined)),
     ok.
 
 queue_filter_combined_with_vhost_test(Config) ->

@@ -30,7 +30,8 @@
          list_login_vhosts_names/2]).
 -export([filter_tracked_conn_list/3]).
 -export([with_decode/5, decode/1, decode/2,
-         args/1, read_complete_body/1, read_complete_body_with_limit/2]).
+         args/1, read_complete_body/1, read_complete_body_with_limit/2,
+         read_urlencoded_body/1]).
 -export([reply_list/3, reply_list/5, reply_list/4,
          sort_list/2, destination_type/1, reply_list_or_paginate/3
          ]).
@@ -158,7 +159,8 @@ auth_config() ->
         end,
     #auth_settings{auth_realm          = ?AUTH_REALM,
                    basic_auth_enabled  = BasicAuthEnabled,
-                   bearer_token_parser = BearerTokenParser}.
+                   bearer_token_parser = BearerTokenParser,
+                   cross_site_origin_allowed = fun rabbit_mgmt_cors:is_origin_allowed/1}.
 
 disable_stats() ->
     not rabbit_mgmt_agent_config:is_metrics_collector_enabled() orelse
@@ -195,10 +197,10 @@ get_authz_data(ReqData) ->
 %% Used for connections / channels. A normal user can only see / delete
 %% their own stuff. Monitors can see other users' and delete their
 %% own. Admins can do it all.
-is_authorized_user(ReqData, Context, Item) ->
+is_authorized_user(ReqData, Context, ItemOrFun) ->
     rabbit_web_dispatch_access_control:is_authorized_user(ReqData,
                                                 Context,
-                                                Item,
+                                                ItemOrFun,
                                                 auth_config()).
 
 %% For policies / parameters. Like is_authorized_vhost but you have to
@@ -848,6 +850,18 @@ do_read_complete_body_with_limit(Req0, Acc, BodySizeLimit) ->
             end
     end.
 
+%% Cowboy exits with the parser's stack trace when a form cannot be parsed. Its
+%% arguments hold the whole body, credentials included, which must not be logged.
+-spec read_urlencoded_body(cowboy_req:req()) ->
+    {ok, [{binary(), binary() | true}], cowboy_req:req()} | {error, malformed_body}.
+read_urlencoded_body(Req) ->
+    try
+        cowboy_req:read_urlencoded_body(Req)
+    catch
+        exit:{request_error, urlencoded_body, _} ->
+            {error, malformed_body}
+    end.
+
 with_decode(Keys, ReqData, Context, Fun) ->
     case read_complete_body(ReqData) of
         {error, http_body_limit_exceeded, LimitApplied, BytesRead} ->
@@ -888,6 +902,18 @@ decode(Keys, Body) ->
         Else -> Else
     end.
 
+-define(DECODE_MAX_HEAP_SIZE_WORDS, 8_000_000).
+
+decode_with_heap_limit(Body) ->
+    Previous = erlang:process_flag(max_heap_size,
+                                   #{size => ?DECODE_MAX_HEAP_SIZE_WORDS,
+                                     kill => true}),
+    try
+        rabbit_json:decode(Body)
+    after
+        erlang:process_flag(max_heap_size, Previous)
+    end.
+
 -type parsed_json() :: map() | atom() | binary().
 -spec decode(binary()) -> {ok, parsed_json()} | {error, term()}.
 
@@ -900,7 +926,7 @@ decode(<<"undefined">>) ->
     {ok, #{}};
 decode(Body) ->
     try
-        case rabbit_json:decode(Body) of
+        case decode_with_heap_limit(Body) of
             Val when is_map(Val) ->
                 {ok, Val};
             %% handle double encoded JSON, see rabbitmq/rabbitmq-management#839
@@ -957,12 +983,12 @@ direct_request(MethodName, Transformers, Extra, ErrorMsg, ReqData,
                       ?LOG_WARNING(ErrorMsg, [Explanation]),
                       bad_request(list_to_binary(Explanation), ReqData1, Context);
                   {badrpc, Reason} ->
-                      Msg = io_lib:format("~tp", [Reason]),
+                      Msg = rabbit_misc:format_term(Reason),
                       ?LOG_WARNING(ErrorMsg, [Msg]),
                       bad_request(
-                        list_to_binary(
-                          io_lib:format("Request to node ~ts failed with ~tp",
-                                        [Node, Reason])),
+                        unicode:characters_to_binary(
+                          io_lib:format("Request to node ~ts failed with ~ts",
+                                        [Node, Msg])),
                         ReqData1, Context);
                   _      -> {true, ReqData1, Context}
               end
@@ -1007,8 +1033,10 @@ props_to_method(MethodName, Props, Transformers, Extra) ->
                            error:badarg -> false
                        end
                end, rabbit_data_coercion:to_list(Props)),
+    ExtraKeys = [K || {K, _} <- Extra],
+    Props2 = [P || {K, _} = P <- Props1, not lists:member(K, ExtraKeys)],
     props_to_method(
-      MethodName, rabbit_mgmt_format:format(Props1 ++ Extra, {Transformers, true})).
+      MethodName, rabbit_mgmt_format:format(Props2 ++ Extra, {Transformers, true})).
 
 props_to_method(MethodName, Props) ->
     Props1 = rabbit_mgmt_format:format(

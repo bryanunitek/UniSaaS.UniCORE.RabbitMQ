@@ -255,6 +255,10 @@ init_per_group1(Group, Config) ->
                        %% the replica reader sends it. The replica exits and is restarted.
                        rabbit_ct_helpers:set_config(
                          Config1c, {ignored_crashes, ["accept_chunk_out_of_order"]});
+                   cluster_size_3 ->
+                       %% A replica still starting when the nodes stop finds its writer gone.
+                       rabbit_ct_helpers:set_config(
+                         Config1c, {ignored_crashes, ["** {badrpc,{'EXIT',noproc}}"]});
                    _ ->
                        Config1c
                end,
@@ -383,7 +387,7 @@ declare_max_age_equivalence(Config) ->
                                              {<<"x-max-age">>, longstr, <<"1D">>}])),
 
     %% "24h" is the same duration as "1D"; see rabbitmq/rabbitmq-server#8509
-    ?assertEqual({'queue.declare_ok', Q, 0, 0},
+    ?assertMatch({'queue.declare_ok', Q, _, 0},
                  declare(Config, Server, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                              {<<"x-max-age">>, longstr, <<"24h">>}])),
 
@@ -400,7 +404,7 @@ declare_max_age_equivalence(Config) ->
     ?assertEqual({'queue.declare_ok', Q2, 0, 0},
                  declare(Config, Server, Q2, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                               {<<"x-max-age">>, longstr, <<"1Y">>}])),
-    ?assertEqual({'queue.declare_ok', Q2, 0, 0},
+    ?assertMatch({'queue.declare_ok', Q2, _, 0},
                  declare(Config, Server, Q2, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                               {<<"x-max-age">>, longstr, <<"365D">>}])),
 
@@ -2058,6 +2062,16 @@ max_segment_size_bytes_validation(Config) ->
        declare(Config, Server, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                    {<<"x-stream-max-segment-size-bytes">>, long, ?MAX_STREAM_MAX_SEGMENT_SIZE + 1_000}])),
 
+    [?assertExit(
+        {{shutdown, {server_initiated_close, 406, _}}, _},
+        declare(Config, Server, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
+                                    {<<"x-stream-max-segment-size-bytes">>, long, Size}]))
+     || Size <- [0, 8, ?MIN_STREAM_MAX_SEGMENT_SIZE - 1]],
+
+    ?assertEqual({'queue.declare_ok', Q, 0, 0},
+                 declare(Config, Server, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
+                                             {<<"x-stream-max-segment-size-bytes">>, long, ?MIN_STREAM_MAX_SEGMENT_SIZE}])),
+
     rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_testcase_queue, [Q]).
 
 
@@ -2069,7 +2083,7 @@ max_age(Config) ->
     ?assertEqual({'queue.declare_ok', Q, 0, 0},
                  declare(Config, Server, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                              {<<"x-max-age">>, longstr, <<"5s">>},
-                                             {<<"x-stream-max-segment-size-bytes">>, long, 250}])),
+                                             {<<"x-stream-max-segment-size-bytes">>, long, ?MIN_STREAM_MAX_SEGMENT_SIZE}])),
 
     Payload = << <<"1">> || _ <- lists:seq(1, 500) >>,
 
@@ -2533,7 +2547,7 @@ update_retention_policy(Config) ->
     Q = ?config(queue_name, Config),
     ?assertEqual({'queue.declare_ok', Q, 0, 0},
                  declare(Config, Server, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
-                                             {<<"x-stream-max-segment-size-bytes">>, long, 200},
+                                             {<<"x-stream-max-segment-size-bytes">>, long, ?MIN_STREAM_MAX_SEGMENT_SIZE},
                                              {<<"x-stream-filter-size-bytes">>, long, 32}
                                             ])),
     check_leader_and_replicas(Config, Servers),
@@ -2598,6 +2612,23 @@ max_segment_size_bytes_policy_validation(Config) ->
                            0,
                            <<"queues">>,
                            <<"acting-user">>]),
+
+    [{error_string, _} = rabbit_ct_broker_helpers:rpc(
+                           Config, 0,
+                           rabbit_policy, set,
+                           [<<"/">>,
+                            PolicyName,
+                            Pattern,
+                            [{<<"stream-max-segment-size-bytes">>, Size}],
+                            0,
+                            <<"queues">>,
+                            <<"acting-user">>])
+     || Size <- [0, 8, ?MIN_STREAM_MAX_SEGMENT_SIZE - 1]],
+
+    ok = rabbit_ct_broker_helpers:set_policy(
+           Config, 0, PolicyName, Pattern, <<"queues">>,
+           [{<<"stream-max-segment-size-bytes">>, ?MIN_STREAM_MAX_SEGMENT_SIZE}]),
+    ok = rabbit_ct_broker_helpers:clear_policy(Config, 0, PolicyName),
     ok.
 
 max_segment_size_bytes_policy(Config) ->
@@ -3044,7 +3075,20 @@ rebalance(Config) ->
                                                 NodeData)
                               end, Summary)
                 end, 30000),
+
+    %% Replicas still starting when the group ends crash on node shutdown
+    ?awaitMatch(true,
+                lists:all(fun(Q) -> all_members_running(Config, Q) end,
+                          [Q1, Q2, Q3, Q4, Q5]),
+                30000),
     ok.
+
+all_members_running(Config, Q) ->
+    QName = rabbit_misc:r(<<"/">>, queue, Q),
+    StreamId = rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, get_stream_id, [QName]),
+    {ok, Members} = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_stream_coordinator,
+                                                 members, [StreamId]),
+    lists:all(fun({Pid, _Role}) -> is_pid(Pid) end, maps:values(Members)).
 
 member_offsets(Config, Server, Q) ->
     Status = rabbit_ct_broker_helpers:rpc(Config, Server, rabbit_stream_queue, status,

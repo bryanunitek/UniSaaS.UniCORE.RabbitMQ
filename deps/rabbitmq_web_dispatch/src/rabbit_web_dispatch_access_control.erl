@@ -83,7 +83,32 @@ is_authorized_vhost_visible_for_monitoring(ReqData, Context, AuthConfig) ->
 is_authorized(ReqData, Context, ErrorMsg, Fun, AuthConfig) ->
     case cowboy_req:method(ReqData) of
         <<"OPTIONS">> -> {true, ReqData, Context};
-        _             -> is_authorized1(ReqData, Context, ErrorMsg, Fun, AuthConfig)
+        _             -> reject_cross_site_or_authorize(ReqData, Context, ErrorMsg, Fun, AuthConfig)
+    end.
+
+reject_cross_site_or_authorize(ReqData, Context, ErrorMsg, Fun, AuthConfig) ->
+    case is_cross_site_state_change(ReqData, AuthConfig) of
+        true ->
+            Msg = "HTTP access denied: cross-site request",
+            ?LOG_WARNING(Msg, [], #{domain => ?RMQLOG_DOMAIN_USER}),
+            halt_response(403, forbidden, Msg, ReqData, Context);
+        false ->
+            is_authorized1(ReqData, Context, ErrorMsg, Fun, AuthConfig)
+    end.
+
+is_cross_site_state_change(_ReqData, #auth_settings{cross_site_origin_allowed = undefined}) ->
+    false;
+is_cross_site_state_change(ReqData, #auth_settings{cross_site_origin_allowed = IsAllowed}) ->
+    case cowboy_req:method(ReqData) of
+        M when M =:= <<"GET">>; M =:= <<"HEAD">> ->
+            false;
+        _ ->
+            case cowboy_req:header(<<"sec-fetch-site">>, ReqData) of
+                Site when Site =:= <<"cross-site">>; Site =:= <<"same-site">> ->
+                    not IsAllowed(cowboy_req:header(<<"origin">>, ReqData));
+                _ ->
+                    false
+            end
     end.
 
 is_authorized1(ReqData, Context, ErrorMsg, Fun, AuthConfig) ->
@@ -176,12 +201,14 @@ is_authorized(ReqData, Context, Username, Password, ErrorMsg, Fun, AuthConfig, R
                         true ->
                             case Fun(User) of
                                 true ->
-                                    rabbit_core_metrics:auth_attempt_succeeded(IP, ResolvedUsername, http),
-                                    ReqData1 = rabbit_cowboy_stream_h:set_authenticated_username(
-                                        ResolvedUsername, ReqData),
-                                    {true, ReqData1,
-                                     Context#context{user     = User,
-                                                     password = Password}};
+                                    authorized(IP, ResolvedUsername, ReqData,
+                                               Context#context{user     = User,
+                                                               password = Password});
+                                {true, Impl} ->
+                                    authorized(IP, ResolvedUsername, ReqData,
+                                               Context#context{user     = User,
+                                                               password = Password,
+                                                               impl     = Impl});
                                 not_found ->
                                     rabbit_core_metrics:auth_attempt_failed(IP, ResolvedUsername, http),
                                     not_found(<<"Not Found">>, ReqData, Context);
@@ -215,16 +242,35 @@ is_authorized(ReqData, Context, Username, Password, ErrorMsg, Fun, AuthConfig, R
 %% Used for connections / channels. A normal user can only see / delete
 %% their own stuff. Monitors can see other users' and delete their
 %% own. Admins can do it all.
-is_authorized_user(ReqData, Context, Item, AuthConfig) ->
+%% An item that has to be looked up is passed as a fun so that it is only
+%% looked up after login. It is also called for monitors and administrators:
+%% callers rely on it to reject invalid range parameters. The item is kept in
+%% the `impl' of the context so that the handler acts on what was authorised.
+is_authorized_user(ReqData, Context, ItemOrFun, AuthConfig) ->
     is_authorized(ReqData, Context,
                   <<"User not authorised to access object">>,
                   fun(#user{username = Username, tags = Tags}) ->
-                          case cowboy_req:method(ReqData) of
-                              <<"DELETE">> -> is_admin(Tags);
-                              _            -> is_monitor(Tags)
-                          end orelse Username == pget(user, Item)
+                          Item = case is_function(ItemOrFun, 0) of
+                                     true  -> ItemOrFun();
+                                     false -> ItemOrFun
+                                 end,
+                          Allowed = case cowboy_req:method(ReqData) of
+                                        <<"DELETE">> -> is_admin(Tags);
+                                        _            -> is_monitor(Tags)
+                                    end orelse is_owner(Username, Item),
+                          case Allowed of
+                              true  -> {true, Item};
+                              false -> false
+                          end
                   end,
                   AuthConfig).
+
+%% A missing object is refused like one of another user, so that the
+%% response does not tell which objects of other users exist.
+is_owner(_Username, not_found) ->
+    false;
+is_owner(Username, Item) ->
+    Username == pget(user, Item).
 
 %% For policies / parameters. Like is_authorized_vhost but you have to
 %% be a policymaker.
@@ -269,7 +315,7 @@ vhost(ReqData) ->
         end
     end.
 
-is_admin(T)       -> intersects(T, [administrator]).
+is_admin(T)       -> rabbit_access_control:is_admin(T).
 is_policymaker(T) -> intersects(T, [administrator, policymaker]).
 is_monitor(T)     -> intersects(T, [administrator, monitoring]).
 is_mgmt_user(T)   -> intersects(T, [administrator, monitoring, policymaker,
@@ -387,6 +433,11 @@ log_access_control_result(NotOK) ->
 
 is_basic_auth_disabled(#auth_settings{basic_auth_enabled = Enabled}) ->
     not Enabled.
+
+authorized(IP, Username, ReqData, Context) ->
+    rabbit_core_metrics:auth_attempt_succeeded(IP, Username, http),
+    ReqData1 = rabbit_cowboy_stream_h:set_authenticated_username(Username, ReqData),
+    {true, ReqData1, Context}.
 
 get_auth_backends() ->
     case application:get_env(rabbitmq_web_dispatch, auth_backends) of
