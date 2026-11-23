@@ -15,9 +15,14 @@ on:
         required: false
         default: 'tags/v4.2.0'
         type: string
+      secondary_erlang_version:
+        required: false
+        default: ''
+        type: string
+        description: 'OTP version of the previous version nodes in mixed clusters, defaults to 27'
       # in almost all cases this should not be set and the ref that triggered
       # the workflow will be used. however, mixed version tests for skip-version
-      # upgrades (eg. 3.13->4.2) need this because they run on scheduled
+      # upgrades (eg. 4.2->4.3) need this because they run on scheduled
       # and scheduled workflows get `main` as ref
       ref:
         required: false
@@ -51,6 +56,7 @@ jobs:
       elixir_version: ${{ inputs.elixir_version }}
       mixed_clusters: ${{ inputs.mixed_clusters }}
       previous_version: ${{ inputs.previous_version }}
+      secondary_erlang_version: ${{ inputs.secondary_erlang_version }}
       make_target: ${{ matrix.make_target }}
       plugin: rabbit
       ref: ${{ inputs.ref }}
@@ -63,6 +69,7 @@ jobs:
       elixir_version: ${{ inputs.elixir_version }}
       mixed_clusters: ${{ inputs.mixed_clusters }}
       previous_version: ${{ inputs.previous_version }}
+      secondary_erlang_version: ${{ inputs.secondary_erlang_version }}
       make_target: parallel-ct-set-1
       plugin: rabbitmq_mqtt
       ref: ${{ inputs.ref }}
@@ -71,13 +78,20 @@ jobs:
   # is therefore run from a separate workflow.
   test-rabbitmq-peer-discovery-aws:
     name: Test rabbitmq_peer_discovery_aws (partially)
+    strategy:
+      fail-fast: false
+      matrix:
+        make_target:
+          - ct-config_schema
+          - ct-unit
     uses: ./.github/workflows/test-make-target.yaml
     with:
       erlang_version: ${{ inputs.erlang_version }}
       elixir_version: ${{ inputs.elixir_version }}
       mixed_clusters: ${{ inputs.mixed_clusters }}
       previous_version: ${{ inputs.previous_version }}
-      make_target: ct-config_schema ct-unit
+      secondary_erlang_version: ${{ inputs.secondary_erlang_version }}
+      make_target: ${{ matrix.make_target }}
       plugin: rabbitmq_peer_discovery_aws
       ref: ${{ inputs.ref }}
 
@@ -95,6 +109,7 @@ jobs:
           - rabbitmq_amqp_client
           - rabbitmq_auth_backend_cache
           - rabbitmq_auth_backend_http
+          - rabbitmq_auth_backend_internal_loopback
           - rabbitmq_auth_backend_ldap
           - rabbitmq_auth_backend_oauth2
           - rabbitmq_auth_mechanism_ssl
@@ -125,6 +140,7 @@ jobs:
           - rabbitmq_stream
           - rabbitmq_stream_common
           - rabbitmq_stream_management
+          - rabbitmq_top
           - rabbitmq_tracing
           - rabbitmq_trust_store
           - rabbitmq_web_dispatch
@@ -136,6 +152,7 @@ jobs:
       elixir_version: ${{ inputs.elixir_version }}
       mixed_clusters: ${{ inputs.mixed_clusters }}
       previous_version: ${{ inputs.previous_version }}
+      secondary_erlang_version: ${{ inputs.secondary_erlang_version }}
       make_target: tests
       plugin: ${{ matrix.plugin }}
       ref: ${{ inputs.ref }}

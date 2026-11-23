@@ -10,6 +10,7 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
+-include_lib("amqp_client/include/amqp_client.hrl").
 -compile(export_all).
 
 -import(shovel_test_utils, [with_amqp10_session/2,
@@ -38,8 +39,11 @@ groups() ->
           amqp091_to_amqp10_with_dead_lettering,
           dest_rejects,
           dest_releases,
+          src_message_too_large,
+          src_message_too_large_no_ack,
           test_amqp10_delete_after_queue_length,
           delete_after_duration_validation,
+          security_validation,
           delete_after_duration_autodeletes,
           delete_after_duration_runs,
           delete_after_duration_runs_long,
@@ -178,6 +182,64 @@ dest_does_not_accept(Config, DeclareDest, DestAddress) ->
               amqp10_expect_empty(Sess, SrcAddress)
       end).
 
+src_message_too_large(Config) ->
+    src_message_too_large(Config, <<"on-confirm">>, [<<"large">>]).
+
+src_message_too_large_no_ack(Config) ->
+    src_message_too_large(Config, <<"no-ack">>, []).
+
+src_message_too_large(Config, AckMode, DeadLettered) ->
+    Src = ?config(srcq, Config),
+    Dest = ?config(destq, Config),
+    DLQ = <<Src/binary, "_dlq">>,
+    SrcAddress = rabbitmq_amqp_address:queue(Src),
+    with_amqp10_session(Config,
+      fun (Sess) ->
+              amqp10_declare_queue(Sess, DLQ, #{}),
+              amqp10_declare_queue(Sess, Src, #{<<"x-dead-letter-exchange">> => {utf8, <<>>},
+                                                <<"x-dead-letter-routing-key">> => {utf8, DLQ}}),
+              amqp10_declare_queue(Sess, Dest, #{}),
+              publish_with_large_header(Config, Src, <<"large">>),
+              amqp10_publish(Sess, SrcAddress, <<"m">>, 1),
+              shovel_test_utils:set_param(Config, ?PARAM,
+                                          [{<<"src-protocol">>, <<"amqp10">>},
+                                           {<<"src-address">>, SrcAddress},
+                                           {<<"dest-protocol">>, <<"amqp10">>},
+                                           {<<"dest-address">>, rabbitmq_amqp_address:queue(Dest)},
+                                           {<<"ack-mode">>, AckMode}]),
+              [Msg] = amqp10_expect_count(Sess, rabbitmq_amqp_address:queue(Dest), 1),
+              ?assertEqual(<<"m1">>, amqp10_msg:body_bin(Msg)),
+              DLQAddress = rabbitmq_amqp_address:queue(DLQ),
+              case DeadLettered of
+                  [] ->
+                      amqp10_expect_empty(Sess, DLQAddress);
+                  _ ->
+                      Msgs = amqp10_expect_count(Sess, DLQAddress, length(DeadLettered)),
+                      ?assertEqual(DeadLettered, [amqp10_msg:body_bin(M) || M <- Msgs])
+              end,
+              amqp10_expect_empty(Sess, SrcAddress)
+      end).
+
+publish_with_large_header(Config, QName, Payload) ->
+    {ok, FrameMax} = rabbit_ct_broker_helpers:rpc(
+                       Config, 0, application, get_env, [rabbit, frame_max]),
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, application, set_env, [rabbit, frame_max, 1_048_576]),
+    try
+        Conn = rabbit_ct_client_helpers:open_unmanaged_connection(Config, 0),
+        {ok, Ch} = amqp_connection:open_channel(Conn),
+        #'confirm.select_ok'{} = amqp_channel:call(Ch, #'confirm.select'{}),
+        Headers = [{<<"k">>, longstr, binary:copy(<<"v">>, 200_000)}],
+        ok = amqp_channel:call(Ch, #'basic.publish'{routing_key = QName},
+                               #amqp_msg{props = #'P_basic'{headers = Headers},
+                                         payload = Payload}),
+        true = amqp_channel:wait_for_confirms(Ch, 5000),
+        ok = rabbit_ct_client_helpers:close_connection_and_channel(Conn, Ch)
+    after
+        ok = rabbit_ct_broker_helpers:rpc(
+               Config, 0, application, set_env, [rabbit, frame_max, FrameMax])
+    end.
+
 test_amqp10_destination(Config, Src, Dest, Sess, Protocol, ProtocolSrc) ->
     MapConfig = ?config(map_config, Config),
     MaybeSrcAddress = case ProtocolSrc of
@@ -304,6 +366,34 @@ delete_after_duration_validation(Config) ->
     ?assertMatch({error_string, _}, Set(<<"whenever">>)),
     ?assertMatch({error_string, _}, Set(100 * 365 * 24 * 60 * 60)),
     ok.
+
+security_validation(Config) ->
+    ok = rabbit_ct_broker_helpers:add_user(Config, <<"a">>, <<"a">>),
+    ok = rabbit_ct_broker_helpers:set_full_permissions(Config, <<"a">>, <<"/">>),
+    try
+        A = lookup_user(Config, <<"a">>),
+        Def = fun(SrcUri) ->
+                      [{<<"src-protocol">>, <<"amqp10">>},
+                       {<<"src-uri">>, SrcUri},
+                       {<<"src-address">>, <<"src">>},
+                       {<<"dest-protocol">>, <<"amqp10">>},
+                       {<<"dest-uri">>, <<"amqp://a:a@localhost:5672">>},
+                       {<<"dest-address">>, <<"dest">>}]
+              end,
+        shovel_test_utils:valid_param(Config, Def(<<"amqp://b:b@localhost:5672">>), A),
+        %% The last URI is not valid.
+        [shovel_test_utils:invalid_param(Config, Def(Uri), A)
+         || Uri <- [<<"amqp://localhost:5672">>,
+                    <<"amqp://a:a@localhost:5672?sasl=anon">>,
+                    <<"amqp://a:a@?sasl=anon">>,
+                    <<"amqp://guest:guest@localhost:5672">>,
+                    <<"amqp://a@localhost:5672">>]],
+        ok = rabbit_ct_broker_helpers:set_user_tags(Config, 0, <<"a">>, [administrator]),
+        shovel_test_utils:valid_param(Config, Def(<<"amqp://localhost:5672">>),
+                                      lookup_user(Config, <<"a">>))
+    after
+        rabbit_ct_broker_helpers:delete_user(Config, <<"a">>)
+    end.
 
 delete_after_duration_autodeletes(Config) ->
     Src = ?config(srcq, Config),

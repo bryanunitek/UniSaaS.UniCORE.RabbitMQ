@@ -17,11 +17,15 @@
 
 all() ->
     [
+      direct_channel_flush,
       amqp_uri_parsing,
       amqp_uri_accepts_string_and_binaries,
       amqp_uri_remove_credentials,
+      amqp_uri_remove_credentials_malformed,
+      amqp_uri_error_info_has_no_user_input,
       uri_parser_accepts_string_and_binaries,
       route_destination_parsing,
+      uri_parser_splits_userinfo_and_query,
       rabbit_channel_build_topic_variable_map,
       main_reader_rejects_oversized_frame,
       main_reader_rejects_oversized_frame_with_split_header,
@@ -31,8 +35,32 @@ all() ->
       main_reader_rejects_invalid_frame_end_marker_in_one_packet,
       main_reader_rejects_buffered_frame_above_negotiated_frame_max,
       main_reader_assembles_frame_split_across_packets,
-      connection_closed_on_frame_above_negotiated_frame_max
+      connection_closed_on_frame_above_negotiated_frame_max,
+      negotiated_frame_max_below_minimum_is_rejected
     ].
+
+%% -------------------------------------------------------------------
+%% Direct channel.
+%% -------------------------------------------------------------------
+
+direct_channel_flush(_Config) ->
+    {ok, Channel} = amqp_channel:start_link(
+                      direct, self(), 1, none, {?MODULE, direct_channel_flush}),
+    {Caller, Ref} = spawn_monitor(
+                      fun() -> ok = rabbit_writer:flush(Channel) end),
+    try
+        receive
+            {'DOWN', Ref, process, Caller, Reason} ->
+                ?assertEqual(normal, Reason)
+        after 5000 ->
+            ct:fail(flush_did_not_reply)
+        end,
+        ?assert(is_process_alive(Channel))
+    after
+        exit(Caller, kill),
+        erlang:demonitor(Ref, [flush]),
+        gen_server:stop(Channel)
+    end.
 
 %% -------------------------------------------------------------------
 %% AMQP URI parsing.
@@ -256,6 +284,72 @@ amqp_uri_remove_credentials(_Config) ->
     ?assertEqual(nomatch, string:find(Sanitized, "alice")),
     ok.
 
+amqp_uri_remove_credentials_malformed(_Config) ->
+    [?assertEqual(Expected, amqp_uri:remove_credentials(Uri))
+     || {Uri, Expected} <-
+            [{"amqp://alice:s3cret@:::",
+              "amqp://<redacted>@:::"},
+             {"amqp://alice:s3@cret@host:::",
+              "amqp://<redacted>@host:::"},
+             {"amqp://alice:s3/cret@host:::",
+              "amqp://<redacted>@host:::"},
+             {"amqp://alice:s3?c#ret@host:::",
+              "amqp://<redacted>@host:::"},
+             {"amqp://host:::?password=s3cret&heartbeat=5",
+              "amqp://host:::"},
+             {"amqp://alice:s3cret@host:::?password=s3cret",
+              "amqp://<redacted>@host:::"},
+             {"amqp://host:::#s3cret",
+              "amqp://host:::"},
+             {<<"amqp://alice:s3cret@:::">>,
+              "amqp://<redacted>@:::"},
+             {"amqp://alice:s3cret@" ++ [16#301] ++ "host",
+              "<redacted>"},
+             {"amqp://host/" ++ [16#20AC] ++ "?password=s3cret",
+              "<redacted>"},
+             {"", "<redacted>"}]],
+    ok.
+
+amqp_uri_error_info_has_no_user_input(_Config) ->
+    [begin
+         {error, {Info, Uri}} = amqp_uri:parse(Uri),
+         ?assertEqual(Expected, Info),
+         ?assertEqual(nomatch,
+                      string:find(lists:flatten(io_lib:format("~tp", [Info])),
+                                  "s3cret"))
+     end || {Uri, Expected} <-
+                [{"s3cret@host", unable_to_parse_uri},
+                 {"amqp://alice:s3cret@:::", unable_to_parse_uri},
+                 {"http://alice:s3cret@host", unexpected_uri_scheme},
+                 {"amqp://alice:s3cret@host:99999", port_out_of_range},
+                 {"amqp:alice:s3cret@host", invalid_uri},
+                 {"amqp://alice:s3cret@host/" ++ [16#1F600], badarg},
+                 {"amqp://alice:s3cret@host/a/b", invalid_vhost},
+                 {"amqp://alice:s3cret@:1234", port_requires_host},
+                 {"amqp://alice:s3cret%zz@host", {invalid_entity, userinfo}},
+                 {"amqp://alice:s3cret%@host", {unterminated_entity, userinfo}},
+                 {"amqp://alice:s3cret@ho%zzst", {invalid_entity, host}},
+                 {"amqp://alice:s3cret@host/v%zzh", {invalid_entity, vhost}},
+                 {"amqp://alice:s3cret@host/?auth_mechanism=s3cret",
+                  unknown_mechanism},
+                 {"amqp://alice:s3cret@host/?heartbeat=s3cret",
+                  {invalid_amqp_params_parameter, heartbeat}},
+                 {"amqp://alice:s3cret@host/?username=s3cret",
+                  {invalid_amqp_params_parameter, username}},
+                 {"amqps://alice:s3cret@host/?verify=s3cret",
+                  {invalid_ssl_parameter, verify}},
+                 {"amqps://alice:s3cret@host/?depth=s3cret&password=s3cret",
+                  {invalid_ssl_parameter, depth}},
+                 {"amqps://alice:s3cret@host/?password=s3cret%zz",
+                  {invalid_ssl_parameter, password}},
+                 {"amqps://localhost/%2f?cacertfile=/dev/zero",
+                  {invalid_ssl_parameter, cacertfile}},
+                 {"amqps://localhost/%2f?certfile=/dev/zero",
+                  {invalid_ssl_parameter, certfile}},
+                 {"amqps://localhost/%2f?keyfile=/dev",
+                  {invalid_ssl_parameter, keyfile}}]],
+    ok.
+
 uri_parser_accepts_string_and_binaries(_Config) ->
     [?assertMatch([{fragment,[]},
                    {host,"host"},
@@ -266,6 +360,18 @@ uri_parser_accepts_string_and_binaries(_Config) ->
                    {userinfo,["user","pass"]}],
                    uri_parser:parse(Uri, []))
         || Uri <- string_binaries_uris()],
+    ok.
+
+uri_parser_splits_userinfo_and_query(_Config) ->
+    Parse = fun(Key, Uri) -> proplists:get_value(Key, uri_parser:parse(Uri, [])) end,
+    ?assertEqual([], Parse('query', "amqp://host")),
+    ?assertEqual([], Parse('query', "amqp://host?")),
+    ?assertEqual([{"a", "b=c"}, "", "d", {"e", ""}, {"", "f"}, ""],
+                 Parse('query', "amqp://host?a=b=c&&d&e=&=f&")),
+    ?assertEqual([], Parse(userinfo, "amqp://host")),
+    ?assertEqual([], Parse(userinfo, "amqp://@host")),
+    ?assertEqual(["user"], Parse(userinfo, "amqp://user@host")),
+    ?assertEqual(["user", "", "pass", ""], Parse(userinfo, "amqp://user::pass:@host")),
     ok.
 
 string_binaries_uris() ->
@@ -606,3 +712,11 @@ split_into_3(Bin) ->
     <<Part1:Third/binary, Rest/binary>> = Bin,
     <<Part2:Third/binary, Part3/binary>> = Rest,
     [Part1, Part2, Part3].
+
+negotiated_frame_max_below_minimum_is_rejected(_Config) ->
+    ?assertEqual(ok, amqp_network_connection:sanity_check_frame_max(?FRAME_MIN_SIZE)),
+    ?assertEqual(ok, amqp_network_connection:sanity_check_frame_max(131072)),
+    ?assertExit({frame_max_too_low, 8, ?FRAME_MIN_SIZE},
+                amqp_network_connection:sanity_check_frame_max(8)),
+    ?assertExit({frame_max_too_low, 8191, ?FRAME_MIN_SIZE},
+                amqp_network_connection:sanity_check_frame_max(8191)).

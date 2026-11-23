@@ -245,6 +245,8 @@
 
 -define(INVALID_HEADERS_KEY, <<"x-invalid-headers">>).
 -define(ROUTING_HEADERS, [<<"CC">>, <<"BCC">>]).
+%% Applies to each of `CC`, `BCC` and `x-cc` separately.
+-define(MAX_ROUTING_HEADER_ENTRIES, 64).
 -define(DELETED_HEADER, <<"BCC">>).
 
 -define(EXCHANGE_DELETE_IN_PROGRESS_COMPONENT, <<"exchange-delete-in-progress">>).
@@ -279,6 +281,11 @@
 
 %% Max value for stream max segment size
 -define(MAX_STREAM_MAX_SEGMENT_SIZE, 3_000_000_000).
+-define(MIN_STREAM_MAX_SEGMENT_SIZE, 4096).
 
 %% Preferred value instead of `infinity`
 -define(GEN_SERVER_CALL_TIMEOUT, 60000).
+
+%% Limits for formatting terms such as with `~tP`
+-define(FORMAT_DEPTH_LIMIT, 10).
+-define(FORMAT_CHARS_LIMIT, 262_144).

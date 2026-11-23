@@ -14,13 +14,14 @@
 -include_lib("amqp10_common/include/amqp10_framing.hrl").
 -include_lib("rabbit/include/mc.hrl").
 -include("rabbit_event_exchange.hrl").
+-include_lib("kernel/include/logger.hrl").
 
 -export([register/0, unregister/0]).
 -export([init/1, handle_call/2, handle_event/2, handle_info/2,
          terminate/2, code_change/3]).
 -export([info/1, info/2]).
 
--export([fmt_proplist/1]). %% testing
+-export([fmt_proplist/1, event_props/2]). %% testing
 
 -define(APP_NAME, rabbitmq_event_exchange).
 
@@ -95,12 +96,25 @@ handle_event(#event{type = Type,
             {ok, State};
         Key ->
             XName = exchange(VHost),
-            Mc = mc_init(Protocol, XName, Key, Props, Timestamp),
-            _ = rabbit_queue_type:publish_at_most_once(XName, Mc),
+            try mc_init(Protocol, XName, Key, event_props(Type, Props), Timestamp) of
+                Mc ->
+                    _ = rabbit_queue_type:publish_at_most_once(XName, Mc)
+            catch throw:Reason ->
+                      ?LOG_WARNING("Event exchange failed to publish a ~ts event: ~tp",
+                                   [Key, Reason])
+            end,
             {ok, State}
     end;
 handle_event(_Event, State) ->
     {ok, State}.
+
+event_props(parameter_set, Props) ->
+    case application:get_env(?APP_NAME, runtime_parameters_include_value, false) of
+        true -> Props;
+        _    -> proplists:delete(value, Props)
+    end;
+event_props(_Type, Props) ->
+    Props.
 
 handle_info({event_exchange, added_first_binding}, State) ->
     {ok, State#state{has_any_bindings = true}};

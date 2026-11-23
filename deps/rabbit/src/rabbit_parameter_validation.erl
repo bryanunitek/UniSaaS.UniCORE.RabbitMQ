@@ -7,14 +7,22 @@
 
 -module(rabbit_parameter_validation).
 
--export([number/2, integer/2, binary/2, amqp091_queue_name/2,
-        boolean/2, list/2, regex/2, proplist/3, enum/1]).
+-export([number/2, non_negative_number/2, integer/2, binary/2,
+         amqp091_queue_name/2, uri/2, boolean/2, list/2, regex/2,
+         proplist/3, enum/1]).
 
 number(_Name, Term) when is_number(Term) ->
     ok;
 
 number(Name, Term) ->
     {error, "~ts should be a number, actually was ~tp", [Name, Term]}.
+
+non_negative_number(_Name, Term) when is_number(Term) andalso Term >= 0 ->
+    ok;
+
+non_negative_number(Name, Term) ->
+    {error, "~ts should be a non-negative number, actually was ~tp",
+     [Name, Term]}.
 
 integer(_Name, Term) when is_integer(Term) ->
     ok;
@@ -36,6 +44,15 @@ amqp091_queue_name(Name, S) when is_binary(S) ->
 
 amqp091_queue_name(Name, Term) ->
     {error, "~ts should be binary, actually was ~tp", [Name, Term]}.
+
+-define(MAX_URI_LENGTH, 65536).
+
+uri(_Name, Term) when is_binary(Term), byte_size(Term) =< ?MAX_URI_LENGTH ->
+    ok;
+uri(Name, Term) when is_binary(Term) ->
+    {error, "~ts must not exceed ~b bytes", [Name, ?MAX_URI_LENGTH]};
+uri(Name, _Term) ->
+    {error, "~ts should be binary", [Name]}.
 
 
 boolean(_Name, Term) when is_boolean(Term) ->

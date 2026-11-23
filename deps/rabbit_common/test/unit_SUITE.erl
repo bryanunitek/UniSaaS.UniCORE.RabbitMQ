@@ -34,6 +34,8 @@ all() ->
 groups() ->
     [
         {parallel_tests, [parallel], [
+            format_term,
+            limit_term,
             data_coercion_as_list,
             data_coercion_to_binary,
             data_coercion_to_binary_rejects_unsupported_types,
@@ -68,11 +70,15 @@ groups() ->
             map_exception_does_not_fail_with_unicode_explaination_case1,
             map_exception_does_not_fail_with_unicode_explaination_case2,
             amqp_table_conversion,
+            utf8_safe_matches_reference,
+            utf8_safe_line_wrapping,
+            amqp_table_non_utf8_keys,
             name_type,
             get_erl_path,
             hexify,
             getstat_or_zero_on_live_socket,
-            getstat_or_zero_on_closed_socket
+            getstat_or_zero_on_closed_socket,
+            ssl_options_check_file
         ]},
         {sequential_tests, [], [
             data_coercion_to_existing_atom_does_not_create_atoms
@@ -398,6 +404,53 @@ data_coercion_to_list(_Config) ->
     IPv6Result = rabbit_data_coercion:to_list(IPv6),
     ?assert(is_list(IPv6Result)).
 
+utf8_safe_matches_reference(_Config) ->
+    Sizes = [0, 1, 3, 56, 57, 58, 113, 114, 115, 228_000],
+    [begin
+         V = binary:copy(<<255>>, N),
+         ?assertEqual(reference_utf8_safe(V), rabbit_misc:utf8_safe(V))
+     end || N <- Sizes],
+    Valid = <<"abc"/utf8, 1087/utf8>>,
+    ?assertEqual(Valid, rabbit_misc:utf8_safe(Valid)).
+
+utf8_safe_line_wrapping(_Config) ->
+    V = binary:copy(<<255>>, 200),
+    Prefix = <<"Not UTF-8, base64 is: ">>,
+    Result = rabbit_misc:utf8_safe(V),
+    ?assertMatch(<<Prefix:22/binary, _/binary>>, Result),
+    <<_:22/binary, Enc/binary>> = Result,
+    Lines = binary:split(Enc, <<"\n">>, [global]),
+    [?assertEqual(76, byte_size(L)) || L <- lists:droplast(Lines)],
+    ?assert(byte_size(lists:last(Lines)) =< 76),
+    ?assertEqual(base64:encode(V), iolist_to_binary(Lines)).
+
+reference_utf8_safe(V) ->
+    case unicode:characters_to_binary(V, unicode, unicode) of
+        B when is_binary(B) ->
+            B;
+        _ ->
+            Enc = reference_split_lines(base64:encode(V)),
+            <<"Not UTF-8, base64 is: ", Enc/binary>>
+    end.
+
+reference_split_lines(<<Text:76/binary, Rest/binary>>) ->
+    <<Text/binary, $\n, (reference_split_lines(Rest))/binary>>;
+reference_split_lines(Text) ->
+    Text.
+
+format_term(_Config) ->
+    Deep = lists:foldl(fun(_, Acc) -> [Acc] end, x, lists:seq(1, 20_000)),
+    ?assert(length(rabbit_misc:format_term(Deep)) < 1000),
+    ?assert(length(rabbit_misc:format_term(binary:copy(<<"a">>, 1_000_000))) < 1000),
+    ?assertEqual("ok", rabbit_misc:format_term(ok)).
+
+limit_term(_Config) ->
+    Deep = lists:foldl(fun(_, Acc) -> {list, [Acc]} end, x, lists:seq(1, 20_000)),
+    Limited = rabbit_misc:limit_term(Deep),
+    ?assert(length(lists:flatten(io_lib:format("~tp", [Limited]))) < 1000),
+    ?assertEqual({a, <<"b">>, [1, 2]}, rabbit_misc:limit_term({a, <<"b">>, [1, 2]})),
+    ?assert(byte_size(rabbit_misc:limit_term(binary:copy(<<"a">>, 1_000_000))) < 1000).
+
 data_coercion_as_list(_Config) ->
     %% Lists pass through unchanged
     ?assertEqual([], rabbit_data_coercion:as_list([])),
@@ -600,6 +653,30 @@ amqp_table_conversion(_Config) ->
                    [{table, [{<<"uri">>, longstr,
                               <<"amqp://localhost/%2F/upstream">>}]}]}]).
 
+amqp_table_non_utf8_keys(_Config) ->
+    Utf8Key = <<"ключ 🐰"/utf8>>,
+    ?assertEqual(#{Utf8Key => 1},
+                 rabbit_misc:amqp_table([{Utf8Key, long, 1}])),
+
+    Sanitised = rabbit_misc:utf8_safe(<<255>>),
+    ?assertNotEqual(<<255>>, Sanitised),
+    ?assertEqual(#{Sanitised => 1},
+                 rabbit_misc:amqp_table([{<<255>>, long, 1}])),
+
+    Table = [{<<255>>, longstr, <<"v">>},
+             {<<254>>, longstr, <<"w">>},
+             {<<"nested">>, table, [{<<255>>, long, 2}]},
+             {<<"arr">>, array, [{table, [{<<255>>, long, 3}]}]}],
+    Map = rabbit_misc:amqp_table(Table),
+    ?assertEqual(4, maps:size(Map)),
+    ?assertEqual(#{Sanitised => 2}, maps:get(<<"nested">>, Map)),
+    ?assertEqual([#{Sanitised => 3}], maps:get(<<"arr">>, Map)),
+    ?assert(is_binary(iolist_to_binary(rabbit_json:encode(Map)))),
+
+    ?assertEqual(#{client_id => <<"c">>},
+                 rabbit_misc:amqp_table([{client_id, longstr, <<"c">>}])),
+    ok.
+
 assert_table(JSON, AMQP) ->
     ?assertEqual(JSON, rabbit_misc:amqp_table(AMQP)),
     ?assertEqual(AMQP, rabbit_misc:to_amqp_table(JSON)).
@@ -647,6 +724,28 @@ getstat_or_zero_on_closed_socket(_) ->
     ok = gen_tcp:close(LSock),
     ?assertEqual(0, rabbit_net:getstat_or_zero(LSock, recv_oct)),
     ?assertEqual(0, rabbit_net:getstat_or_zero(LSock, send_oct)),
+    ok.
+
+ssl_options_check_file(Config) ->
+    Dir = ?config(priv_dir, Config),
+    Small = filename:join(Dir, "small.pem"),
+    Empty = filename:join(Dir, "empty.pem"),
+    Large = filename:join(Dir, "large.pem"),
+    ok = file:write_file(Small, <<"-----BEGIN CERTIFICATE-----">>),
+    ok = file:write_file(Empty, <<>>),
+    ok = file:write_file(Large, binary:copy(<<"a">>, 4 * 1024 * 1024 + 1)),
+    ?assertEqual(ok, rabbit_ssl_options:check_file(Small)),
+    ?assertEqual({error, empty}, rabbit_ssl_options:check_file(Empty)),
+    ?assertEqual({error, too_large}, rabbit_ssl_options:check_file(Large)),
+    ?assertEqual({error, not_a_regular_file}, rabbit_ssl_options:check_file("/dev/zero")),
+    ?assertEqual({error, not_a_regular_file}, rabbit_ssl_options:check_file(Dir)),
+    ?assertEqual({error, enoent},
+                 rabbit_ssl_options:check_file(filename:join(Dir, "missing.pem"))),
+    ?assertEqual(ok, rabbit_ssl_options:check_file_options(
+                       [{cacertfile, Small}, {verify, verify_peer}])),
+    ?assertEqual({error, {keyfile, not_a_regular_file}},
+                 rabbit_ssl_options:check_file_options(
+                   [{cacertfile, Small}, {keyfile, "/dev/zero"}])),
     ok.
 
 date_time_parse_duration(_) ->

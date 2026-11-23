@@ -58,6 +58,7 @@ groups() ->
        test_update_secret,
        cannot_update_username_after_authenticated,
        cannot_use_another_authmechanism_when_updating_secret,
+       cannot_change_authmechanism_during_authentication,
        update_secret_should_close_connection_if_wrong_secret,
        update_secret_should_close_connection_if_unauthorized_vhost,
        unauthenticated_client_rejected_tcp_connected,
@@ -75,6 +76,8 @@ groups() ->
        user_connection_limit,
        node_connection_limit,
        connection_should_be_closed_on_token_expiry,
+       connection_should_be_closed_if_token_expired_at_open,
+       connection_should_be_closed_if_token_expired_at_update_secret,
        should_receive_metadata_update_after_update_secret,
        store_offset_requires_read_access,
        metadata_requires_read_or_write_access,
@@ -83,6 +86,7 @@ groups() ->
        test_super_stream_duplicate_partitions,
        authentication_error_should_close_with_delay,
        unauthorized_vhost_access_should_close_with_delay,
+       vhost_access_check_uses_proxy_protocol_client_address,
        sasl_anonymous,
        test_publisher_with_too_long_reference_errors,
        test_consumer_with_too_long_reference_errors,
@@ -223,6 +227,17 @@ init_per_testcase(close_connection_on_consumer_update_timeout = TestCase, Config
                                       set_env,
                                       [rabbitmq_stream, request_timeout, 2000]),
     rabbit_ct_helpers:testcase_started(Config, TestCase);
+init_per_testcase(cannot_change_authmechanism_during_authentication = TestCase,
+                  Config) ->
+    {ok, Mechanisms} = rabbit_ct_broker_helpers:rpc(Config, 0, application,
+                                                    get_env,
+                                                    [rabbit, auth_mechanisms]),
+    ok = rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env,
+                                      [rabbit, auth_mechanisms,
+                                       ['RABBIT-CR-DEMO' | Mechanisms]]),
+    rabbit_ct_helpers:testcase_started(
+      rabbit_ct_helpers:set_config(Config, {auth_mechanisms, Mechanisms}),
+      TestCase);
 init_per_testcase(vhost_queue_limit = TestCase, Config) ->
     QueueCount = rabbit_ct_broker_helpers:rpc(Config,
                                               0,
@@ -260,6 +275,13 @@ init_per_testcase(unauthorized_vhost_access_should_close_with_delay = TestCase, 
   ok = rabbit_ct_broker_helpers:add_user(Config, <<"other">>),
   rabbit_ct_helpers:testcase_started(Config, TestCase);
 
+init_per_testcase(vhost_access_check_uses_proxy_protocol_client_address = TestCase, Config) ->
+    ok = rabbit_ct_broker_helpers:add_user(Config, <<"other">>),
+    ok = rabbit_ct_broker_helpers:set_full_permissions(Config, <<"other">>, <<"/">>),
+    ok = rpc(Config, 0, application, set_env, [rabbitmq_stream, proxy_protocol, true]),
+    ok = rpc(Config, 0, meck, new, [rabbit_auth_backend_internal, [no_link, passthrough]]),
+    rabbit_ct_helpers:testcase_started(Config, TestCase);
+
 init_per_testcase(sub_entry_batch_validation = TestCase, Config) ->
     ok = rabbit_ct_broker_helpers:rpc(Config,
                                       0,
@@ -293,6 +315,13 @@ end_per_testcase(close_connection_on_consumer_update_timeout = TestCase, Config)
                                       set_env,
                                       [rabbitmq_stream, request_timeout, 60000]),
     rabbit_ct_helpers:testcase_finished(Config, TestCase);
+end_per_testcase(cannot_change_authmechanism_during_authentication = TestCase,
+                 Config) ->
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, application, set_env,
+           [rabbit, auth_mechanisms,
+            rabbit_ct_helpers:get_config(Config, auth_mechanisms)]),
+    rabbit_ct_helpers:testcase_finished(Config, TestCase);
 end_per_testcase(vhost_queue_limit = TestCase, Config) ->
     _ = rabbit_ct_broker_helpers:rpc(Config,
                                      0,
@@ -320,6 +349,11 @@ end_per_testcase(route_partitions_require_read_or_write_access = TestCase, Confi
     ok = rabbit_ct_broker_helpers:delete_user(Config, <<"test">>),
     rabbit_ct_helpers:testcase_finished(Config, TestCase);
 end_per_testcase(unauthorized_vhost_access_should_close_with_delay = TestCase, Config) ->
+    ok = rabbit_ct_broker_helpers:delete_user(Config, <<"other">>),
+    rabbit_ct_helpers:testcase_finished(Config, TestCase);
+end_per_testcase(vhost_access_check_uses_proxy_protocol_client_address = TestCase, Config) ->
+    ok = rpc(Config, 0, meck, unload, [rabbit_auth_backend_internal]),
+    ok = rpc(Config, 0, application, set_env, [rabbitmq_stream, proxy_protocol, false]),
     ok = rabbit_ct_broker_helpers:delete_user(Config, <<"other">>),
     rabbit_ct_helpers:testcase_finished(Config, TestCase);
 end_per_testcase(TestCase, Config)
@@ -417,6 +451,36 @@ cannot_use_another_authmechanism_when_updating_secret(Config) ->
             try_authenticate(gen_tcp, S, C0, <<"EXTERNAL">>, <<"guest">>, <<"new_password">>),
             ?RESPONSE_SASL_CANNOT_CHANGE_MECHANISM),
     closed = wait_for_socket_close(gen_tcp, S, 10),
+    ok.
+
+cannot_change_authmechanism_during_authentication(Config) ->
+    T = gen_tcp,
+    StartCrDemo =
+        fun() ->
+                {ok, S} = T:connect("localhost", get_port(T, Config), get_opts(T)),
+                C1 = test_peer_properties(T, S, rabbit_stream_core:init(0)),
+                ok = T:send(S, request(sasl_handshake)),
+                {{response, _, {sasl_handshake, ?RESPONSE_CODE_OK, _}}, C2} =
+                    receive_commands(T, S, C1),
+                {Challenge, C3} = sasl_authenticate(T, S, C2,
+                                                    <<"RABBIT-CR-DEMO">>, <<"guest">>),
+                ?assertMatch({response, 2,
+                              {sasl_authenticate, ?RESPONSE_SASL_CHALLENGE, _}},
+                             Challenge),
+                {S, C3}
+        end,
+    {S1, C1} = StartCrDemo(),
+    _ = expect_unsuccessful_authentication(
+          try_authenticate(T, S1, C1, <<"PLAIN">>, <<"guest">>, <<"guest">>),
+          ?RESPONSE_SASL_CANNOT_CHANGE_MECHANISM),
+    closed = wait_for_socket_close(T, S1, 10),
+    {S2, C2} = StartCrDemo(),
+    C3 = expect_successful_authentication(
+           sasl_authenticate(T, S2, C2, <<"RABBIT-CR-DEMO">>,
+                             <<"My password is guest">>)),
+    C4 = tune(T, S2, C3),
+    {ok, _} = stream_test_utils:close(S2, C4),
+    closed = wait_for_socket_close(T, S2, 10),
     ok.
 
 update_secret_should_close_connection_if_wrong_secret(Config) ->
@@ -1130,7 +1194,14 @@ max_segment_size_bytes_validation(Config) ->
     ?assertMatch({response, 1,
                   {create_stream, ?RESPONSE_CODE_PRECONDITION_FAILED}},
                  Cmd),
-    test_close(Transport, S, C3),
+    ok = Transport:send(S, request(2, {create_stream, Stream,
+                                       #{<<"stream-max-segment-size-bytes">> =>
+                                         <<"8">>}})),
+    {Cmd2, C4} = receive_commands(Transport, S, C3),
+    ?assertMatch({response, 2,
+                  {create_stream, ?RESPONSE_CODE_PRECONDITION_FAILED}},
+                 Cmd2),
+    test_close(Transport, S, C4),
     ok.
 
 close_connection_on_consumer_update_timeout(Config) ->
@@ -1379,6 +1450,53 @@ connection_should_be_closed_on_token_expiry(Config) ->
     test_authenticate(T, S, C1),
     closed = wait_for_socket_close(T, S, 10),
     ok = rpc(Config, 0, meck, unload, [Mod]).
+
+connection_should_be_closed_if_token_expired_at_open(Config) ->
+    rabbit_ct_broker_helpers:setup_meck(Config),
+    Mod = rabbit_access_control,
+    ok = rpc(Config, 0, meck, new, [Mod, [no_link, passthrough]]),
+    ok = rpc(Config, 0, meck, expect, [Mod, check_user_loopback, 2, ok]),
+    ok = rpc(Config, 0, meck, expect, [Mod, check_vhost_access, 4, ok]),
+    ok = rpc(Config, 0, meck, expect, [Mod, permission_cache_can_expire, 1, true]),
+    Expiry = os:system_time(seconds) - 60,
+    ok = rpc(Config, 0, meck, expect, [Mod, expiry_timestamp, 1, Expiry]),
+    try
+        T = gen_tcp,
+        Port = get_port(T, Config),
+        Opts = get_opts(T),
+        {ok, S} = T:connect("localhost", Port, Opts),
+        C0 = rabbit_stream_core:init(0),
+        C1 = test_peer_properties(T, S, C0),
+        test_authenticate(T, S, C1),
+        closed = wait_for_socket_close(T, S, 10)
+    after
+        ok = rpc(Config, 0, meck, unload, [Mod])
+    end.
+
+connection_should_be_closed_if_token_expired_at_update_secret(Config) ->
+    rabbit_ct_broker_helpers:setup_meck(Config),
+    Mod = rabbit_access_control,
+    ok = rpc(Config, 0, meck, new, [Mod, [no_link, passthrough]]),
+    ok = rpc(Config, 0, meck, expect, [Mod, check_user_loopback, 2, ok]),
+    ok = rpc(Config, 0, meck, expect, [Mod, check_vhost_access, 4, ok]),
+    ok = rpc(Config, 0, meck, expect, [Mod, permission_cache_can_expire, 1, true]),
+    Now = os:system_time(seconds),
+    ok = rpc(Config, 0, meck, expect, [Mod, expiry_timestamp, 1, Now + 60]),
+    try
+        T = gen_tcp,
+        Port = get_port(T, Config),
+        Opts = get_opts(T),
+        {ok, S} = T:connect("localhost", Port, Opts),
+        C0 = rabbit_stream_core:init(0),
+        C1 = test_peer_properties(T, S, C0),
+        C2 = test_authenticate(T, S, C1),
+        ok = rpc(Config, 0, meck, expect, [Mod, expiry_timestamp, 1, Now - 60]),
+        expect_successful_authentication(
+          try_authenticate(T, S, C2, <<"PLAIN">>, <<"guest">>, <<"guest">>)),
+        closed = wait_for_socket_close(T, S, 10)
+    after
+        ok = rpc(Config, 0, meck, unload, [Mod])
+    end.
 
 should_receive_metadata_update_after_update_secret(Config) ->
     T = gen_tcp,
@@ -1738,6 +1856,26 @@ unauthorized_vhost_access_should_close_with_delay(Config) ->
     End = erlang:monotonic_time(millisecond),
     %% the stream reader module defines the delay (3 seconds)
     ?assert(End - Start > 2_000),
+    closed = wait_for_socket_close(T, S, 10),
+    ok.
+
+vhost_access_check_uses_proxy_protocol_client_address(Config) ->
+    T = gen_tcp,
+    Port = get_port(T, Config),
+    Opts = get_opts(T),
+    {ok, S} = T:connect("localhost", Port, Opts),
+    ok = T:send(S, "PROXY TCP4 192.168.1.1 192.168.1.2 80 81\r\n"),
+    C0 = rabbit_stream_core:init(0),
+    C1 = test_peer_properties(T, S, C0),
+    User = <<"other">>,
+    Call = [rabbit_auth_backend_internal, check_vhost_access,
+            ['_', <<"/">>, #{peeraddr => {192, 168, 1, 1}}]],
+    C2 = test_authenticate(T, S, C1, User),
+    ?assertEqual(1, rpc(Config, 0, meck, num_calls, Call)),
+    C3 = expect_successful_authentication(
+           try_authenticate(T, S, C2, <<"PLAIN">>, User, User)),
+    ?assertEqual(2, rpc(Config, 0, meck, num_calls, Call)),
+    _C4 = test_close(T, S, C3),
     closed = wait_for_socket_close(T, S, 10),
     ok.
 

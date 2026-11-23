@@ -8,6 +8,7 @@
 -module(unit_policy_validators_SUITE).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("rabbit_common/include/rabbit.hrl").
 
 -compile(nowarn_export_all).
 -compile(export_all).
@@ -32,11 +33,13 @@ groups() ->
           delivery_limit,
           classic_queue_lazy_mode,
           length_limit_overflow_mode,
+          stream_max_segment_size_bytes,
           delayed_retry_type,
           delayed_retry_min,
           delayed_retry_max,
           delayed_retry_min_required_with_type,
-          delayed_retry_max_not_less_than_min
+          delayed_retry_max_not_less_than_min,
+          validation_error_formatting
         ]}
     ].
 
@@ -114,6 +117,12 @@ length_limit_overflow_mode(_Config) ->
         [<<"drop-head">>, <<"reject-publish">>, <<"reject-publish-dlx">>],
         %% invalid values
         [<<"unknown">>, <<"publish">>, <<"overflow">>, <<"mode">>]).
+
+stream_max_segment_size_bytes(_Config) ->
+    test_valid_and_invalid_values(<<"stream-max-segment-size-bytes">>,
+        [?MIN_STREAM_MAX_SEGMENT_SIZE, 500_000_000, ?MAX_STREAM_MAX_SEGMENT_SIZE],
+        [-1, 0, 8, ?MIN_STREAM_MAX_SEGMENT_SIZE - 1,
+         ?MAX_STREAM_MAX_SEGMENT_SIZE + 1, <<"a.binary">>]).
 
 %%
 %% Implementation
@@ -199,3 +208,12 @@ delayed_retry_max_not_less_than_min(_Config) ->
                  rabbit_quorum_queue:validate_policy([{<<"delayed-retry-type">>, <<"all">>},
                                                      {<<"delayed-retry-min">>, 1000},
                                                      {<<"delayed-retry-max">>, 5000}])).
+
+validation_error_formatting(_Config) ->
+    Wide = [[lists:seq(1, 64) || _ <- lists:seq(1, 256)] || _ <- lists:seq(1, 256)],
+    Deep = lists:foldl(fun(_, Acc) -> [Acc] end, 1, lists:seq(1, 20_000)),
+    {error_string, Msg} = rabbit_runtime_parameters:format_error(
+                            [{"~tp is not a valid message TTL", [Wide]},
+                             {"~tp is not a valid queue expiry", [Deep]}]),
+    ?assertMatch("Validation failed\n\n" ++ _, Msg),
+    ?assert(length(Msg) < 1_000_000).

@@ -89,6 +89,7 @@ groups() ->
       {direct_connection_tests, [], [
           {parallel_tests, [parallel], [
               basic_get_direct,
+              direct_channel_shutdown,
               no_user,
               no_password
               | ?COMMON_PARALLEL_TEST_CASES]},
@@ -368,7 +369,25 @@ safe_call_timeouts_test(Params = #amqp_params_network{}) ->
 
     ?assertEqual(TestConnTimeout + ?CALL_TIMEOUT_DEVIATION, amqp_util:call_timeout()),
 
-    meck:unload(amqp_network_connection);
+    meck:unload(amqp_network_connection),
+
+    EnvBefore = application:get_env(amqp_client, gen_server_call_timeout),
+    Self = self(),
+    spawn_link(fun() -> Self ! {call_timeout, amqp_util:call_timeout()} end),
+    OtherBefore = receive {call_timeout, T0} -> T0 end,
+    amqp_util:update_call_timeout(TestCallTimeout),
+
+    LargeConnTimeout = 300000,
+    Params2 = Params#amqp_params_network{connection_timeout = LargeConnTimeout},
+    {ok, Connection2} = amqp_connection:start(Params2),
+    ?assertEqual(LargeConnTimeout + ?CALL_TIMEOUT_DEVIATION, amqp_util:call_timeout()),
+    ?assertEqual(EnvBefore,
+                 application:get_env(amqp_client, gen_server_call_timeout)),
+    spawn_link(fun() -> Self ! {call_timeout, amqp_util:call_timeout()} end),
+    ?assertEqual(OtherBefore, receive {call_timeout, T1} -> T1 end),
+
+    ?assertEqual(ok, amqp_connection:close(Connection2)),
+    wait_for_death(Connection2);
 
 safe_call_timeouts_test(Params = #amqp_params_direct{}) ->
     %% We must mock net_kernel:get_net_ticktime/0 as changing
@@ -812,6 +831,33 @@ basic_ack_call(Config) ->
         = amqp_channel:call(Channel, #'basic.get'{queue = Q, no_ack = false}),
     amqp_channel:call(Channel, #'basic.ack'{delivery_tag = Tag}),
     teardown(Connection, Channel).
+
+%% -------------------------------------------------------------------
+
+direct_channel_shutdown(Config) ->
+    {ok, Connection} = new_connection(Config),
+    try
+        {ok, Channel} = amqp_connection:open_channel(Connection),
+        Infos = rabbit_ct_broker_helpers:rpc(
+                  Config, 0, rabbit_channel, info_local, [[pid, connection]]),
+        [ServerChannel] = [Pid || [{pid, Pid}, {connection, Conn}] <- Infos,
+                                  Conn =:= Connection],
+        Ref = erlang:monitor(process, ServerChannel),
+        try
+            ok = rabbit_channel:shutdown(ServerChannel),
+            receive
+                {'DOWN', Ref, process, ServerChannel, Reason} ->
+                    ?assertEqual(normal, Reason)
+            after 5000 ->
+                ct:fail(direct_channel_shutdown_timed_out)
+            end,
+            ?assert(is_process_alive(Channel))
+        after
+            erlang:demonitor(Ref, [flush])
+        end
+    after
+        amqp_connection:close(Connection)
+    end.
 
 %% -------------------------------------------------------------------
 

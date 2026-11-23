@@ -359,10 +359,7 @@ start_cluster(Q) ->
                                             #{nodes => UIDs})
             end,
 
-    Versions = [V || {ok, V} <- erpc:multicall(FollowerNodes,
-                                               rabbit_fifo, version, [],
-                                               ?RPC_TIMEOUT)],
-    MinVersion = lists:min([rabbit_fifo:version() | Versions]),
+    MinVersion = min_machine_version(FollowerNodes),
 
     ?LOG_DEBUG("Will start up to ~w replicas for quorum ~ts with "
                      "leader on node '~ts', initial machine version ~b",
@@ -1038,7 +1035,8 @@ recover(_Vhost, Queues) ->
                                           [rabbit_misc:rs(QName), Err1]),
                        % queue was never started on this node
                        % so needs to be started from scratch.
-                       case start_server(make_ra_conf(Q, ServerId)) of
+                       case start_server(make_ra_conf(Q, ServerId, voter,
+                                                 min_machine_version(get_nodes(Q)))) of
                            ok ->
                                _ = ra:trigger_election(ServerId),
                                ok;
@@ -1639,7 +1637,8 @@ do_add_member(Q0, Node, Membership, Timeout)
     case erpc_call(Node, rabbit_fifo, version, [], infinity) of
         {error, _} = Err ->
             Err;
-        MachineVersion ->
+        NodeVersion ->
+            MachineVersion = min(NodeVersion, min_machine_version(get_nodes(Q0))),
             Conf = make_ra_conf(Q, ServerId, Membership, MachineVersion),
             case ra:start_server(?RA_SYSTEM, Conf) of
                 ok ->
@@ -2379,8 +2378,10 @@ members(Q) when ?amqqueue_is_quorum(Q) ->
 format_ra_event(ServerId, Evt, QRef) ->
     {'$gen_cast', {queue_event, QRef, {ServerId, Evt}}}.
 
-make_ra_conf(Q, ServerId) ->
-    make_ra_conf(Q, ServerId, voter, rabbit_fifo:version()).
+min_machine_version(Nodes) ->
+    Versions = [V || {ok, V} <- erpc:multicall(Nodes, rabbit_fifo, version, [],
+                                               ?RPC_TIMEOUT)],
+    lists:min([rabbit_fifo:version() | Versions]).
 
 make_ra_conf(Q, ServerId, Membership, MacVersion)
   when is_integer(MacVersion) ->
@@ -2730,8 +2731,9 @@ leader_health_check(QueueNameOrRegEx, VHost, ProcessLimitThreshold) ->
                 {resource, _VHostN, queue, QueueName} = QResource = amqqueue:get_name(Q),
                 case rabbit_re:run(QueueName, QueueNameOrRegEx) of
                     match ->
-                        {ClusterName, _} = rabbit_amqqueue:pid_of(Q),
-                        _Pid = spawn(fun() -> run_leader_health_check(ClusterName, QResource, HealthCheckRef, ParentPID) end);
+                        {ClusterName, LeaderNode} = amqqueue:get_pid(Q),
+                        Members = [{ClusterName, N} || N <- [LeaderNode | lists:delete(LeaderNode, get_nodes(Q))]],
+                        _Pid = spawn(fun() -> run_leader_health_check(Members, QResource, HealthCheckRef, ParentPID) end);
                     _ ->
                         []
                 end
@@ -2740,13 +2742,11 @@ leader_health_check(QueueNameOrRegEx, VHost, ProcessLimitThreshold) ->
     _ = spawn(fun() -> maybe_log_leader_health_check_result(Result) end),
     Result.
 
-run_leader_health_check(ClusterName, QResource, HealthCheckRef, From) ->
-    Leader = ra_leaderboard:lookup_leader(ClusterName),
-
-    %% Ignoring result here is required to clear a diayzer warning.
+run_leader_health_check(Members, QResource, HealthCheckRef, From) ->
+    %% Followers redirect the query to their known leader, so only a leader replies.
     _ =
-        case ra_server_proc:ping(Leader, ?LEADER_HEALTH_CHECK_TIMEOUT) of
-            {pong,leader} ->
+        case ra:members(Members, ?LEADER_HEALTH_CHECK_TIMEOUT) of
+            {ok, _, _} ->
                 From ! {ok, HealthCheckRef, QResource};
             _ ->
                 From ! {error, HealthCheckRef, QResource}
